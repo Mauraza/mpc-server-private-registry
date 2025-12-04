@@ -2,7 +2,10 @@ module github.com/igonzalez/mpc-server-private-registry
 
 go 1.25.3
 
-require github.com/modelcontextprotocol/go-sdk v1.1.0
+require (
+	github.com/hashicorp/go-version v1.8.0
+	github.com/modelcontextprotocol/go-sdk v1.1.0
+)
 
 require (
 	github.com/google/jsonschema-go v0.3.0 // indirect
