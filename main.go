@@ -75,28 +75,6 @@ type ScanProjectResult struct {
 	Images []ImageVulnerabilitySummary `json:"images"`
 }
 
-// ScanHelmChartParams defines the input for the Helm chart scanning tool.
-type ScanHelmChartParams struct {
-	Project    string `json:"project" jsonschema:"The Harbor project name"`
-	Repository string `json:"repository" jsonschema:"The Helm chart repository name"`
-	Tag        string `json:"tag" jsonschema:"The chart version (tag) to scan"`
-}
-
-// TrivyMisconfiguration represents a single misconfiguration found by Trivy.
-type TrivyMisconfiguration struct {
-	Type        string `json:"Type"`
-	ID          string `json:"ID"`
-	Title       string `json:"Title"`
-	Description string `json:"Description"`
-	Severity    string `json:"Severity"`
-}
-
-// TrivyScanResult is the output of the Trivy scan for misconfigurations.
-// TrivyScanResult is the output of the Trivy scan.
-type TrivyScanResult struct {
-	Misconfigurations []TrivyMisconfiguration `json:"Misconfigurations"`
-}
-
 // HarborVulnerabilityReport represents the structure of the vulnerability report
 // object returned by Harbor, which contains the list of vulnerabilities.
 type HarborVulnerabilityReport struct {
@@ -832,134 +810,6 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 	}, ScanProjectResult{Images: allSummaries}, nil
 }
 
-// ScanHelmChart downloads a Helm chart from Harbor and scans it with Trivy.
-func ScanHelmChart(ctx context.Context, req *mcp.CallToolRequest, args ScanHelmChartParams) (*mcp.CallToolResult, TrivyScanResult, error) {
-	if *harborPassword == "" {
-		return nil, TrivyScanResult{}, fmt.Errorf("harbor-password flag is not set")
-	}
-	if args.Project == "" || args.Repository == "" || args.Tag == "" {
-		return nil, TrivyScanResult{}, fmt.Errorf("project, repository, and tag are required parameters")
-	}
-
-	// Sanitize string inputs.
-	args.Project = strings.TrimSpace(args.Project)
-	args.Repository = strings.TrimSpace(args.Repository)
-	args.Tag = strings.TrimSpace(args.Tag)
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow insecure TLS
-			},
-		},
-	}
-
-	// 1. Trigger a scan on the Helm chart artifact in Harbor.
-	repoNameEncoded := strings.ReplaceAll(args.Repository, "/", "%2F")
-	log.Printf("Triggering scan for Helm chart: %s/%s:%s", args.Project, args.Repository, args.Tag)
-	scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
-		*harborURL, args.Project, repoNameEncoded, args.Tag)
-
-	scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, nil)
-	if err != nil {
-		return nil, TrivyScanResult{}, fmt.Errorf("failed to create scan request for helm chart: %w", err)
-	}
-	scanReq.SetBasicAuth(*harborUsername, *harborPassword)
-
-	scanResp, err := httpClient.Do(scanReq)
-	if err != nil {
-		return nil, TrivyScanResult{}, fmt.Errorf("failed to trigger scan for helm chart: %w", err)
-	}
-	defer scanResp.Body.Close()
-
-	if scanResp.StatusCode != http.StatusAccepted && scanResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(scanResp.Body)
-		return nil, TrivyScanResult{}, fmt.Errorf("failed to trigger helm chart scan, status %d: %s", scanResp.StatusCode, string(body))
-	}
-	log.Printf("Helm chart scan triggered successfully.")
-
-	// 2. Poll for the misconfiguration report.
-	reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities",
-		*harborURL, args.Project, repoNameEncoded, args.Tag)
-
-	var reportData map[string]struct {
-		Misconfigurations []TrivyMisconfiguration `json:"misconfigurations"`
-	}
-	var reportFound bool
-	for i := 0; i < 60; i++ { // Poll for up to 5 minutes.
-		time.Sleep(5 * time.Second)
-
-		reportReq, err := http.NewRequestWithContext(ctx, "GET", reportURL, nil)
-		if err != nil {
-			return nil, TrivyScanResult{}, fmt.Errorf("failed to create report request for helm chart: %w", err)
-		}
-		reportReq.SetBasicAuth(*harborUsername, *harborPassword)
-		// The report type for misconfigurations is different from vulnerabilities.
-		reportReq.Header.Set("Accept", "application/vnd.security.vulnerability.report; version=1.1")
-
-		reportResp, err := httpClient.Do(reportReq)
-		if err != nil {
-			return nil, TrivyScanResult{}, fmt.Errorf("failed to get helm chart report: %w", err)
-		}
-
-		if reportResp.StatusCode == http.StatusOK {
-			if err := json.NewDecoder(reportResp.Body).Decode(&reportData); err != nil {
-				reportResp.Body.Close()
-				return nil, TrivyScanResult{}, fmt.Errorf("failed to decode helm chart report: %w", err)
-			}
-			reportResp.Body.Close()
-			reportFound = true
-			break
-		}
-		reportResp.Body.Close()
-	}
-
-	if !reportFound {
-		return nil, TrivyScanResult{}, fmt.Errorf("timed out waiting for helm chart scan report")
-	}
-
-	var allMisconfigurations []TrivyMisconfiguration
-	for _, report := range reportData {
-		if report.Misconfigurations != nil {
-			allMisconfigurations = report.Misconfigurations
-			break
-		}
-	}
-
-	if len(allMisconfigurations) == 0 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: "Trivy scan completed. No misconfigurations found."},
-			},
-		}, TrivyScanResult{}, nil
-	}
-
-	// 3. Format the result
-	result := TrivyScanResult{
-		Misconfigurations: allMisconfigurations,
-	}
-
-	summaryText := fmt.Sprintf("Trivy scan found %d misconfigurations in Helm chart %s:%s.", len(allMisconfigurations), args.Repository, args.Tag)
-	if len(allMisconfigurations) > 0 {
-		var high, critical int
-		for _, m := range allMisconfigurations {
-			if m.Severity == "HIGH" {
-				high++
-			} else if m.Severity == "CRITICAL" {
-				critical++
-			}
-		}
-		summaryText += fmt.Sprintf(" Summary: %d CRITICAL, %d HIGH.", critical, high)
-	}
-
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{Text: summaryText},
-		},
-	}, result, nil
-}
-
 // FindPatchedImage searches for a newer version of an image without a specific CVE.
 // It searches in the local Harbor, then registry.suse.com, and finally Docker Hub.
 func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPatchedImageParams) (*mcp.CallToolResult, FindPatchedImageResult, error) {
@@ -1191,10 +1041,14 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	suseRepoToSearch := "suse/" + args.Repository
 	log.Printf("Attempting direct tag listing for SUSE repository: %s", suseRepoToSearch)
 	suseRepoFullName := "registry.suse.com/" + suseRepoToSearch
+	proxyProjectName := "proxy-suse"
+	if err := ensureProxyProject(ctx, proxyProjectName, "https://registry.suse.com", httpClient); err != nil {
+		log.Printf("Failed to ensure SUSE proxy project exists, SUSE search may fail: %v", err)
+	}
 	tags, err := listTagsWithCrane(ctx, suseRepoFullName)
 	if err == nil {
-		suseSearchPerformed = true // Mark that we've successfully interacted with this repo.
-		newerTags := findNewerTags(tags, args.Tag)
+		suseSearchPerformed = true                 // Mark that we've successfully interacted with this repo.
+		newerTags := findNewerTags(tags, args.Tag) // Assuming crane returns tags sorted by version
 		log.Printf("Found %d newer tags for SUSE repo %s using crane: %v", len(newerTags), suseRepoToSearch, newerTags)
 		for _, tag := range newerTags {
 			imageToScan := fmt.Sprintf("%s:%s", suseRepoFullName, tag)
@@ -1202,7 +1056,11 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in registry.suse.com: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "registry.suse.com"}, nil
 		}
 	} else {
-		log.Printf("crane command failed for %s (%v), falling back to HTTP API.", suseRepoFullName, err)
+		if err != exec.ErrNotFound {
+			log.Printf("crane command failed for %s (%v), falling back to HTTP API.", suseRepoFullName, err)
+		} else {
+			log.Printf("'crane' command not found, falling back to HTTP API for SUSE search.")
+		}
 		// Fallback to HTTP API
 		suseDirectTagsURL := fmt.Sprintf("https://registry.suse.com/v2/%s/tags/list", suseRepoToSearch)
 		tagsReq, httpErr := http.NewRequestWithContext(ctx, "GET", suseDirectTagsURL, nil)
@@ -1224,12 +1082,14 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 				} else {
 					newerTags := findNewerTags(tagsResult.Tags, args.Tag)
 					log.Printf("Found %d newer tags for SUSE repo %s: %v", len(newerTags), suseRepoToSearch, newerTags)
-					for _, tag := range newerTags {
-						imageToScan := fmt.Sprintf("registry.suse.com/%s:%s", suseRepoToSearch, tag)
-						log.Printf("Found patched image in registry.suse.com: %s", imageToScan)
-						return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in registry.suse.com: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "registry.suse.com"}, nil
-					}
 					tagsResp.Body.Close()
+					for _, tag := range newerTags {
+						cveFound, err := scanHarborArtifact(ctx, proxyProjectName, suseRepoToSearch, tag, args.CVEID, httpClient)
+						if err == nil && !cveFound {
+							imageToScan := fmt.Sprintf("registry.suse.com/%s:%s", suseRepoToSearch, tag)
+							return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in registry.suse.com: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "registry.suse.com"}, nil
+						}
+					}
 				}
 			} else {
 				if tagsResp != nil {
@@ -1248,8 +1108,6 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 		matchingRepos, err := searchReposWithCrane(ctx, "registry.suse.com", baseRepoName)
 		if err != nil {
 			log.Printf("crane catalog search failed: %v", err)
-			// Since crane failed, we don't proceed to Docker Hub and just return not found.
-			// This could be changed to continue to Docker Hub if desired.
 		}
 
 		log.Printf("crane catalog found %d potential repositories for '%s'", len(matchingRepos), baseRepoName)
@@ -1284,11 +1142,13 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 
 			newerTags := findNewerTags(tagsResult.Tags, args.Tag)
 			log.Printf("Found %d newer tags for SUSE repo %s to check: %v", len(newerTags), repoName, newerTags)
+			// Now we can scan the image:tag
 			for _, tag := range newerTags {
-				// Now we can scan the image:tag
-				imageToScan := fmt.Sprintf("registry.suse.com/%s:%s", repoName, tag)
-				log.Printf("Found patched image in registry.suse.com: %s", imageToScan)
-				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in registry.suse.com: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "registry.suse.com"}, nil
+				cveFound, err := scanHarborArtifact(ctx, proxyProjectName, repoName, tag, args.CVEID, httpClient)
+				if err == nil && !cveFound {
+					imageToScan := fmt.Sprintf("registry.suse.com/%s:%s", repoName, tag)
+					return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in registry.suse.com: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "registry.suse.com"}, nil
+				}
 			}
 		}
 	}
@@ -1617,10 +1477,6 @@ func main() {
 		Name:        "scan_project",
 		Description: "Scans all images in a Harbor project and provides a vulnerability summary.",
 	}, ScanProject)
-	mcp.AddTool(harborServer, &mcp.Tool{
-		Name:        "scan_helm_chart",
-		Description: "Scans a Helm chart in Harbor for misconfigurations using Trivy.",
-	}, ScanHelmChart)
 	mcp.AddTool(harborServer, &mcp.Tool{
 		Name:        "find_patched_image",
 		Description: "Finds a newer version of an image without a specific CVE.",
