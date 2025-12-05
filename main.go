@@ -134,12 +134,51 @@ type GetVulnerabilitiesResult struct {
 	TotalCount      int             `json:"total_count"`
 }
 
+// GetSBOMParams defines the input for the tool that retrieves the SBOM for a given image.
+type GetSBOMParams struct {
+	Project    string `json:"project" jsonschema:"The Harbor project name"`
+	Repository string `json:"repository" jsonschema:"The repository name within the project"`
+	Tag        string `json:"tag" jsonschema:"The image tag to get the SBOM for"`
+}
+
+// GetSBOMResult is the output of the get_sbom tool.
+type GetSBOMResult struct {
+	ImageName string                 `json:"image_name"`
+	SBOM      map[string]interface{} `json:"sbom,omitempty"`
+	// SBOMURL is the direct download link for the Software Bill of Materials.
+	SBOMURL string `json:"sbom_url,omitempty"`
+}
+
+// GetProjectSBOMParams defines the input for the tool that retrieves SBOMs for all images in a project.
+type GetProjectSBOMParams struct {
+	Project string `json:"project" jsonschema:"The Harbor project name"`
+}
+
+// SBOMInfo holds the SBOM for a single image.
+type SBOMInfo struct {
+	ImageName  string `json:"image_name"`
+	ScanStatus string `json:"scan_status"`
+	SBOMURL    string `json:"sbom_url,omitempty"`
+}
+
+// GetProjectSBOMResult is the output of the get_project_sbom tool.
+type GetProjectSBOMResult struct {
+}
+
 // ScanImage is a tool handler that triggers a vulnerability scan in Harbor for a given
 // container image and returns the results.
 func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImageParams) (*mcp.CallToolResult, ScanResult, error) {
 	if *harborPassword == "" {
 		return nil, ScanResult{}, fmt.Errorf("harbor-password flag is not set")
 	}
+	if args.Project == "" || args.Repository == "" || args.Tag == "" {
+		return nil, ScanResult{}, fmt.Errorf("harbor-password flag is not set")
+	}
+
+	// Sanitize string inputs to prevent issues with leading/trailing whitespace.
+	args.Project = strings.TrimSpace(args.Project)
+	args.Repository = strings.TrimSpace(args.Repository)
+	args.Tag = strings.TrimSpace(args.Tag)
 
 	// The repository name in the Harbor API needs to be URL-encoded,
 	// especially if it contains slashes.
@@ -158,11 +197,14 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 		},
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, nil)
+	// Include "vulnerability" in the scan request.
+	scanPayload := strings.NewReader(`{"scan_type": "vulnerability"}`)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, scanPayload)
 	if err != nil {
 		return nil, ScanResult{}, fmt.Errorf("failed to create scan request: %w", err)
 	}
 	httpReq.SetBasicAuth(*harborUsername, *harborPassword)
+	httpReq.Header.Set("Content-Type", "application/json")
 
 	scanResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -240,6 +282,14 @@ func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetV
 	if *harborPassword == "" {
 		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("harbor-password flag is not set")
 	}
+	if args.Project == "" || args.Repository == "" || args.Tag == "" {
+		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("project, repository, and tag are required parameters")
+	}
+
+	// Sanitize string inputs.
+	args.Project = strings.TrimSpace(args.Project)
+	args.Repository = strings.TrimSpace(args.Repository)
+	args.Tag = strings.TrimSpace(args.Tag)
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -300,6 +350,288 @@ func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetV
 	}, result, nil
 }
 
+// GetSBOM retrieves the Software Bill of Materials (SBOM) for a specific container image from Harbor.
+func GetSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetSBOMParams) (*mcp.CallToolResult, GetSBOMResult, error) {
+	if *harborPassword == "" {
+		return nil, GetSBOMResult{}, fmt.Errorf("harbor-password flag is not set")
+	}
+	if args.Project == "" || args.Repository == "" || args.Tag == "" {
+		return nil, GetSBOMResult{}, fmt.Errorf("project, repository, and tag are required parameters")
+	}
+
+	// Sanitize string inputs.
+	args.Project = strings.TrimSpace(args.Project)
+	args.Repository = strings.TrimSpace(args.Repository)
+	args.Tag = strings.TrimSpace(args.Tag)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Allow insecure TLS
+			},
+		},
+	}
+
+	repo := strings.ReplaceAll(args.Repository, "/", "%2F")
+
+	// 1. Get artifact details to find the digest.
+	artifactURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s",
+		*harborURL, args.Project, repo, args.Tag)
+	log.Printf("Getting artifact details from: %s", artifactURL)
+	artifactReq, err := http.NewRequestWithContext(ctx, "GET", artifactURL, nil)
+	if err != nil {
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to create artifact details request: %w", err)
+	}
+	artifactReq.SetBasicAuth(*harborUsername, *harborPassword)
+	artifactResp, err := httpClient.Do(artifactReq)
+	if err != nil {
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to get artifact details: %w", err)
+	}
+	defer artifactResp.Body.Close()
+
+	if artifactResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(artifactResp.Body)
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to get artifact details, status %d: %s", artifactResp.StatusCode, string(body))
+	}
+
+	var artifact struct {
+		Digest string `json:"digest"`
+	}
+	if err := json.NewDecoder(artifactResp.Body).Decode(&artifact); err != nil {
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to decode artifact details: %w", err)
+	}
+
+	if artifact.Digest == "" {
+		return nil, GetSBOMResult{}, fmt.Errorf("could not find digest for artifact %s/%s:%s", args.Project, args.Repository, args.Tag)
+	}
+	log.Printf("Found digest '%s' for artifact %s/%s:%s", artifact.Digest, args.Project, args.Repository, args.Tag)
+
+	// 2. Download the SBOM using the digest.
+	sbomURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/sbom",
+		*harborURL, args.Project, repo, artifact.Digest)
+	log.Printf("Downloading SBOM from: %s", sbomURL)
+
+	sbomReq, err := http.NewRequestWithContext(ctx, "GET", sbomURL, nil)
+	if err != nil {
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to create SBOM download request: %w", err)
+	}
+	sbomReq.SetBasicAuth(*harborUsername, *harborPassword)
+	// The API returns a JSON response that contains the SBOM as a raw JSON object.
+	sbomReq.Header.Set("Accept", "application/json")
+
+	var sbomResp *http.Response
+	sbomResp, err = httpClient.Do(sbomReq)
+	if err != nil {
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to download SBOM: %w", err)
+	}
+
+	if sbomResp.StatusCode == http.StatusOK {
+		goto found
+	} else if sbomResp.StatusCode == http.StatusNotFound {
+		// SBOM does not exist, we need to trigger a scan.
+		log.Printf("SBOM not found for %s. Triggering a scan.", artifact.Digest)
+		scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
+			*harborURL, args.Project, repo, args.Tag)
+		scanPayload := strings.NewReader(`{"scan_type": "sbom"}`)
+		scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, scanPayload)
+		if err != nil {
+			return nil, GetSBOMResult{}, fmt.Errorf("failed to create scan request: %w", err)
+		}
+		scanReq.SetBasicAuth(*harborUsername, *harborPassword)
+		scanReq.Header.Set("Content-Type", "application/json")
+		scanReq.Header.Set("X-Accept-Vulnerabilities", "application/vnd.security.vulnerability.report; version=1.1, application/vnd.cyclonedx+json; version=1.4")
+
+		scanResp, err := httpClient.Do(scanReq)
+		if err != nil {
+			return nil, GetSBOMResult{}, fmt.Errorf("failed to trigger scan: %w", err)
+		}
+		defer scanResp.Body.Close()
+
+		if scanResp.StatusCode != http.StatusAccepted {
+			body, _ := io.ReadAll(scanResp.Body)
+			return nil, GetSBOMResult{}, fmt.Errorf("failed to trigger scan, status %d: %s", scanResp.StatusCode, string(body))
+		}
+
+		// Poll for the SBOM to become available.
+		for i := 0; i < 60; i++ { // Poll for up to 5 minutes
+			time.Sleep(5 * time.Second)
+			pollResp, err := httpClient.Do(sbomReq) // Reuse the sbomReq
+			if err != nil {
+				continue
+			}
+			if pollResp.StatusCode == http.StatusOK {
+				sbomResp = pollResp
+				goto found
+			}
+			pollResp.Body.Close()
+		}
+		return nil, GetSBOMResult{}, fmt.Errorf("timed out waiting for SBOM after scan")
+	} else {
+		body, _ := io.ReadAll(sbomResp.Body)
+		sbomResp.Body.Close()
+		// Check for a specific Harbor limitation with Docker v2 manifests.
+		if strings.Contains(string(body), "SBOM isn't supported for IMAGE") {
+			// Construct the UI link for the SBOM
+			uiLink := fmt.Sprintf("%s/harbor/projects/1/repositories/%s/artifacts-tab/artifacts/%s?tab=sbom", strings.TrimSuffix(*harborURL, "/api/v2.0"), args.Repository, artifact.Digest)
+			imageName := fmt.Sprintf("%s/%s:%s", args.Project, args.Repository, args.Tag)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("Harbor does not support SBOM generation for image %s because it uses an older manifest format (Docker v2). However, the SBOM may be available in the Harbor UI at: %s", imageName, uiLink)},
+				},
+			}, GetSBOMResult{ImageName: imageName, SBOMURL: uiLink}, nil
+		}
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to download SBOM, status %d: %s", sbomResp.StatusCode, string(body))
+	}
+
+found:
+	var sbom map[string]interface{}
+	if err := json.NewDecoder(sbomResp.Body).Decode(&sbom); err != nil {
+		sbomResp.Body.Close()
+		return nil, GetSBOMResult{}, fmt.Errorf("failed to decode SBOM: %w", err)
+	}
+	sbomResp.Body.Close()
+
+	result := GetSBOMResult{
+		ImageName: fmt.Sprintf("%s/%s:%s", args.Project, args.Repository, args.Tag),
+		SBOM:      sbom,
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Successfully retrieved SBOM for image %s.", result.ImageName)}},
+	}, result, nil
+}
+
+// GetProjectSBOM retrieves the Software Bill of Materials (SBOM) for all images in a specific Harbor project.
+func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProjectSBOMParams) (*mcp.CallToolResult, GetProjectSBOMResult, error) {
+	if *harborPassword == "" {
+		return nil, GetProjectSBOMResult{}, fmt.Errorf("harbor-password flag is not set")
+	}
+	if args.Project == "" {
+		return nil, GetProjectSBOMResult{}, fmt.Errorf("project is a required parameter")
+	}
+
+	// Sanitize string inputs.
+	args.Project = strings.TrimSpace(args.Project)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Allow insecure TLS
+			},
+		},
+	}
+
+	// 1. List repositories in the project
+	log.Printf("Starting SBOM retrieval for project: %s", args.Project)
+	reposURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories", *harborURL, args.Project)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", reposURL, nil)
+	if err != nil {
+		return nil, GetProjectSBOMResult{}, fmt.Errorf("failed to create list repositories request: %w", err)
+	}
+	httpReq.SetBasicAuth(*harborUsername, *harborPassword)
+
+	repoResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, GetProjectSBOMResult{}, fmt.Errorf("failed to list repositories: %w", err)
+	}
+	defer repoResp.Body.Close()
+
+	if repoResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(repoResp.Body)
+		return nil, GetProjectSBOMResult{}, fmt.Errorf("failed to list repositories, status %d: %s", repoResp.StatusCode, string(body))
+	}
+
+	type Repository struct {
+		Name string `json:"name"`
+	}
+	var repositories []Repository
+	if err := json.NewDecoder(repoResp.Body).Decode(&repositories); err != nil {
+		return nil, GetProjectSBOMResult{}, fmt.Errorf("failed to decode repositories list: %w", err)
+	}
+	log.Printf("Found %d repositories in project %s.", len(repositories), args.Project)
+
+	var imagesScanned int
+
+	// 2. For each repository, list artifacts and get their SBOM.
+	for _, repo := range repositories {
+		log.Printf("Processing repository for SBOMs: %s", repo.Name)
+		repoNameOnly := strings.TrimPrefix(repo.Name, args.Project+"/")
+		repoNameEncoded := strings.ReplaceAll(repoNameOnly, "/", "%2F")
+
+		artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts", *harborURL, args.Project, repoNameEncoded)
+		artifactsReq, err := http.NewRequestWithContext(ctx, "GET", artifactsURL, nil)
+		if err != nil {
+			log.Printf("Error creating artifacts request for %s: %v", repo.Name, err)
+			continue
+		}
+		artifactsReq.SetBasicAuth(*harborUsername, *harborPassword)
+
+		artifactsResp, err := httpClient.Do(artifactsReq)
+		if err != nil {
+			log.Printf("Error listing artifacts for %s: %v", repo.Name, err)
+			continue
+		}
+
+		type Artifact struct {
+			Type   string `json:"type"`
+			Digest string `json:"digest"`
+			Tags   []struct {
+				// We only need the name for now.
+				Name string `json:"name"`
+			} `json:"tags"`
+		}
+		var artifacts []Artifact
+		if err := json.NewDecoder(artifactsResp.Body).Decode(&artifacts); err != nil {
+			log.Printf("Error decoding artifacts for %s: %v", repo.Name, err)
+			artifactsResp.Body.Close()
+			continue
+		}
+		artifactsResp.Body.Close()
+
+		// 3. For each image artifact, get its SBOM.
+		for _, artifact := range artifacts {
+			if artifact.Type != "IMAGE" || len(artifact.Tags) == 0 {
+				continue
+			}
+			tag := artifact.Tags[0].Name // Use the first tag.
+
+			// Trigger an SBOM scan for the image artifact.
+			log.Printf("Triggering SBOM scan for image: %s:%s", repo.Name, tag)
+			scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
+				*harborURL, args.Project, repoNameEncoded, tag)
+
+			scanPayload := strings.NewReader(`{"scan_type": "sbom"}`)
+			scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, scanPayload)
+			if err != nil {
+				log.Printf("Error creating SBOM scan request for %s:%s: %v", repo.Name, tag, err)
+				continue
+			}
+			scanReq.SetBasicAuth(*harborUsername, *harborPassword)
+			scanReq.Header.Set("Content-Type", "application/json")
+			scanReq.Header.Set("X-Accept-Vulnerabilities", "application/vnd.cyclonedx+json; version=1.4")
+
+			scanResp, err := httpClient.Do(scanReq)
+			if err != nil {
+				log.Printf("Error triggering SBOM scan for %s:%s: %v", repo.Name, tag, err)
+				continue
+			}
+			scanResp.Body.Close()
+
+			if scanResp.StatusCode == http.StatusAccepted {
+				imagesScanned++
+			} else {
+				log.Printf("Failed to trigger SBOM scan for %s:%s, status: %d", repo.Name, tag, scanResp.StatusCode)
+			}
+		}
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Successfully triggered SBOM generation for %d images in project %s. The SBOMs will be available shortly.", imagesScanned, args.Project)}},
+	}, GetProjectSBOMResult{}, nil
+}
+
 // ScanProject scans all images in a given Harbor project and returns a summary of vulnerabilities.
 func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProjectParams) (*mcp.CallToolResult, ScanProjectResult, error) {
 	if *harborPassword == "" {
@@ -307,6 +639,12 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 		log.Println("Error: harbor-password flag is not set.")
 		return nil, ScanProjectResult{}, fmt.Errorf("harbor-password flag is not set")
 	}
+	if args.Project == "" {
+		return nil, ScanProjectResult{}, fmt.Errorf("harbor-password flag is not set")
+	}
+
+	// Sanitize string inputs.
+	args.Project = strings.TrimSpace(args.Project)
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -402,12 +740,15 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 			scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
 				*harborURL, args.Project, repoNameEncoded, tag)
 
-			scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, nil)
+			// Include "vulnerability" in the scan request.
+			scanPayload := strings.NewReader(`{"scan_type": "vulnerability"}`)
+			scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, scanPayload)
 			if err != nil {
 				log.Printf("Error creating scan request for %s:%s: %v", repo.Name, tag, err)
 				continue
 			}
 			scanReq.SetBasicAuth(*harborUsername, *harborPassword)
+			scanReq.Header.Set("Content-Type", "application/json")
 
 			scanResp, err := httpClient.Do(scanReq)
 			if err != nil {
@@ -496,6 +837,14 @@ func ScanHelmChart(ctx context.Context, req *mcp.CallToolRequest, args ScanHelmC
 	if *harborPassword == "" {
 		return nil, TrivyScanResult{}, fmt.Errorf("harbor-password flag is not set")
 	}
+	if args.Project == "" || args.Repository == "" || args.Tag == "" {
+		return nil, TrivyScanResult{}, fmt.Errorf("project, repository, and tag are required parameters")
+	}
+
+	// Sanitize string inputs.
+	args.Project = strings.TrimSpace(args.Project)
+	args.Repository = strings.TrimSpace(args.Repository)
+	args.Tag = strings.TrimSpace(args.Tag)
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -617,6 +966,15 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	if *harborPassword == "" {
 		return nil, FindPatchedImageResult{}, fmt.Errorf("harbor-password flag is not set")
 	}
+	if args.Project == "" || args.Repository == "" || args.Tag == "" || args.CVEID == "" {
+		return nil, FindPatchedImageResult{}, fmt.Errorf("project, repository, tag, and cve_id are required parameters")
+	}
+
+	// Sanitize string inputs.
+	args.Project = strings.TrimSpace(args.Project)
+	args.Repository = strings.TrimSpace(args.Repository)
+	args.Tag = strings.TrimSpace(args.Tag)
+	args.CVEID = strings.TrimSpace(args.CVEID)
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -1271,6 +1629,14 @@ func main() {
 		Name:        "get_vulnerabilities",
 		Description: "Retrieves all vulnerabilities for a specific container image from Harbor.",
 	}, GetVulnerabilities)
+	mcp.AddTool(harborServer, &mcp.Tool{
+		Name:        "get_sbom",
+		Description: "Retrieves the Software Bill of Materials (SBOM) for a specific container image from Harbor.",
+	}, GetSBOM)
+	mcp.AddTool(harborServer, &mcp.Tool{
+		Name:        "get_project_sbom",
+		Description: "Retrieves the Software Bill of Materials (SBOM) for all images in a Harbor project.",
+	}, GetProjectSBOM)
 
 	log.Printf("MCP servers serving at %s", addr)
 	handler := mcp.NewStreamableHTTPHandler(
