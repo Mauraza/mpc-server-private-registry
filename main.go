@@ -27,14 +27,14 @@ import (
 var (
 	host           = flag.String("host", "localhost", "host to listen on")
 	port           = flag.String("port", "8080", "port to listen on")
-	harborURL      = flag.String("harbor-url", "http://localhost:8081", "Harbor instance URL")
-	harborUsername = flag.String("harbor-username", "admin", "Harbor username for API access")
-	harborPassword = flag.String("harbor-password", "", "Harbor password for API access")
+	privateRegistryURL      = flag.String("private-registry-url", "http://localhost:8081", "Private Registry instance URL")
+	privateRegistryUsername = flag.String("private-registry-username", "admin", "Private Registry username for API access")
+	privateRegistryPassword = flag.String("private-registry-password", "", "Private Registry password for API access")
 )
 
-// ScanImageParams defines the input for the Harbor image scanning tool.
+// ScanImageParams defines the input for the privateRegistry image scanning tool.
 type ScanImageParams struct {
-	Project    string `json:"project" jsonschema:"The Harbor project name"`
+	Project    string `json:"project" jsonschema:"The privateRegistry project name"`
 	Repository string `json:"repository" jsonschema:"The repository name within the project"`
 	Tag        string `json:"tag" jsonschema:"The image tag to scan"`
 }
@@ -56,7 +56,7 @@ type ScanResult struct {
 
 // ScanProjectParams defines the input for scanning all images in a project.
 type ScanProjectParams struct {
-	Project string `json:"project" jsonschema:"The Harbor project name to scan"`
+	Project string `json:"project" jsonschema:"The privateRegistry project name to scan"`
 }
 
 // ImageVulnerabilitySummary provides a summary of vulnerabilities for a single image.
@@ -75,15 +75,15 @@ type ScanProjectResult struct {
 	Images []ImageVulnerabilitySummary `json:"images"`
 }
 
-// HarborVulnerabilityReport represents the structure of the vulnerability report
-// object returned by Harbor, which contains the list of vulnerabilities.
-type HarborVulnerabilityReport struct {
+// privateRegistryVulnerabilityReport represents the structure of the vulnerability report
+// object returned by privateRegistry, which contains the list of vulnerabilities.
+type privateRegistryVulnerabilityReport struct {
 	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
 }
 
 // FindPatchedImageParams defines the input for the tool that finds a patched image.
 type FindPatchedImageParams struct {
-	Project    string `json:"project" jsonschema:"The Harbor project name of the image"`
+	Project    string `json:"project" jsonschema:"The Private Registry project name of the image"`
 	Repository string `json:"repository" jsonschema:"The repository name of the image"`
 	Tag        string `json:"tag" jsonschema:"The current tag of the image to find a patch for"`
 	CVEID      string `json:"cve_id" jsonschema:"The CVE ID to check for absence in newer versions"`
@@ -100,7 +100,7 @@ type FindPatchedImageResult struct {
 
 // GetVulnerabilitiesParams defines the input for the tool that retrieves all vulnerabilities for a given image.
 type GetVulnerabilitiesParams struct {
-	Project    string `json:"project" jsonschema:"The Harbor project name"`
+	Project    string `json:"project" jsonschema:"The Private Registry project name"`
 	Repository string `json:"repository" jsonschema:"The repository name within the project"`
 	Tag        string `json:"tag" jsonschema:"The image tag to get vulnerabilities for"`
 }
@@ -114,7 +114,7 @@ type GetVulnerabilitiesResult struct {
 
 // GetSBOMParams defines the input for the tool that retrieves the SBOM for a given image.
 type GetSBOMParams struct {
-	Project    string `json:"project" jsonschema:"The Harbor project name"`
+	Project    string `json:"project" jsonschema:"The Private Registry project name"`
 	Repository string `json:"repository" jsonschema:"The repository name within the project"`
 	Tag        string `json:"tag" jsonschema:"The image tag to get the SBOM for"`
 }
@@ -129,7 +129,7 @@ type GetSBOMResult struct {
 
 // GetProjectSBOMParams defines the input for the tool that retrieves SBOMs for all images in a project.
 type GetProjectSBOMParams struct {
-	Project string `json:"project" jsonschema:"The Harbor project name"`
+	Project string `json:"project" jsonschema:"The Private Registry project name"`
 }
 
 // SBOMInfo holds the SBOM for a single image.
@@ -143,14 +143,14 @@ type SBOMInfo struct {
 type GetProjectSBOMResult struct {
 }
 
-// ScanImage is a tool handler that triggers a vulnerability scan in Harbor for a given
+// ScanImage is a tool handler that triggers a vulnerability scan in Private Registry for a given
 // container image and returns the results.
 func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImageParams) (*mcp.CallToolResult, ScanResult, error) {
-	if *harborPassword == "" {
-		return nil, ScanResult{}, fmt.Errorf("harbor-password flag is not set")
+	if *privateRegistryPassword == "" {
+		return nil, ScanResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 	if args.Project == "" || args.Repository == "" || args.Tag == "" {
-		return nil, ScanResult{}, fmt.Errorf("harbor-password flag is not set")
+		return nil, ScanResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 
 	// Sanitize string inputs to prevent issues with leading/trailing whitespace.
@@ -158,13 +158,13 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 	args.Repository = strings.TrimSpace(args.Repository)
 	args.Tag = strings.TrimSpace(args.Tag)
 
-	// The repository name in the Harbor API needs to be URL-encoded,
+	// The repository name in the Private Registry API needs to be URL-encoded,
 	// especially if it contains slashes.
 	repo := strings.ReplaceAll(args.Repository, "/", "%2F")
 
 	// 1. Trigger the scan
 	scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
-		*harborURL, args.Project, repo, args.Tag)
+		*privateRegistryURL, args.Project, repo, args.Tag)
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -181,7 +181,7 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 	if err != nil {
 		return nil, ScanResult{}, fmt.Errorf("failed to create scan request: %w", err)
 	}
-	httpReq.SetBasicAuth(*harborUsername, *harborPassword)
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	scanResp, err := httpClient.Do(httpReq)
@@ -203,9 +203,9 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 	// In a production system, you might want a more robust polling strategy with timeouts.
 	// For this example, we'll poll for a short period.
 	reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities",
-		*harborURL, args.Project, repo, args.Tag)
+		*privateRegistryURL, args.Project, repo, args.Tag)
 
-	var reportData map[string]HarborVulnerabilityReport
+	var reportData map[string]privateRegistryVulnerabilityReport
 	for i := 0; i < 60; i++ { // Poll up to 60 times
 		time.Sleep(5 * time.Second) // Wait before checking
 
@@ -213,7 +213,7 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 		if err != nil {
 			return nil, ScanResult{}, fmt.Errorf("failed to create report request: %w", err)
 		}
-		reportReq.SetBasicAuth(*harborUsername, *harborPassword)
+		reportReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 		reportReq.Header.Set("Accept", "application/json")
 
 		reportResp, err := httpClient.Do(reportReq)
@@ -222,7 +222,7 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 		}
 
 		if reportResp.StatusCode == http.StatusOK {
-			// Harbor returns a map where the key is the mime-type of the report.
+			// Private Registry returns a map where the key is the mime-type of the report.
 			if err := json.NewDecoder(reportResp.Body).Decode(&reportData); err != nil {
 				reportResp.Body.Close()
 				return nil, ScanResult{}, fmt.Errorf("failed to decode report: %w", err)
@@ -255,10 +255,10 @@ found:
 	}, ScanResult{Vulnerabilities: vulnerabilities}, nil
 }
 
-// GetVulnerabilities retrieves the vulnerability report for a specific container image from Harbor.
+// GetVulnerabilities retrieves the vulnerability report for a specific container image from privateRegistry.
 func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetVulnerabilitiesParams) (*mcp.CallToolResult, GetVulnerabilitiesResult, error) {
-	if *harborPassword == "" {
-		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("harbor-password flag is not set")
+	if *privateRegistryPassword == "" {
+		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 	if args.Project == "" || args.Repository == "" || args.Tag == "" {
 		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("project, repository, and tag are required parameters")
@@ -280,7 +280,7 @@ func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetV
 
 	repo := strings.ReplaceAll(args.Repository, "/", "%2F")
 	reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities",
-		*harborURL, args.Project, repo, args.Tag)
+		*privateRegistryURL, args.Project, repo, args.Tag)
 
 	log.Printf("Fetching vulnerabilities for %s/%s:%s", args.Project, args.Repository, args.Tag)
 
@@ -288,7 +288,7 @@ func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetV
 	if err != nil {
 		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("failed to create report request: %w", err)
 	}
-	reportReq.SetBasicAuth(*harborUsername, *harborPassword)
+	reportReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 	reportReq.Header.Set("Accept", "application/json")
 
 	reportResp, err := httpClient.Do(reportReq)
@@ -302,7 +302,7 @@ func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetV
 		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("failed to get vulnerability report, status %d: %s", reportResp.StatusCode, string(body))
 	}
 
-	var reportData map[string]HarborVulnerabilityReport
+	var reportData map[string]privateRegistryVulnerabilityReport
 	if err := json.NewDecoder(reportResp.Body).Decode(&reportData); err != nil {
 		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("failed to decode report: %w", err)
 	}
@@ -328,10 +328,10 @@ func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetV
 	}, result, nil
 }
 
-// GetSBOM retrieves the Software Bill of Materials (SBOM) for a specific container image from Harbor.
+// GetSBOM retrieves the Software Bill of Materials (SBOM) for a specific container image from privateRegistry.
 func GetSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetSBOMParams) (*mcp.CallToolResult, GetSBOMResult, error) {
-	if *harborPassword == "" {
-		return nil, GetSBOMResult{}, fmt.Errorf("harbor-password flag is not set")
+	if *privateRegistryPassword == "" {
+		return nil, GetSBOMResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 	if args.Project == "" || args.Repository == "" || args.Tag == "" {
 		return nil, GetSBOMResult{}, fmt.Errorf("project, repository, and tag are required parameters")
@@ -355,13 +355,13 @@ func GetSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetSBOMParams) 
 
 	// 1. Get artifact details to find the digest.
 	artifactURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s",
-		*harborURL, args.Project, repo, args.Tag)
+		*privateRegistryURL, args.Project, repo, args.Tag)
 	log.Printf("Getting artifact details from: %s", artifactURL)
 	artifactReq, err := http.NewRequestWithContext(ctx, "GET", artifactURL, nil)
 	if err != nil {
 		return nil, GetSBOMResult{}, fmt.Errorf("failed to create artifact details request: %w", err)
 	}
-	artifactReq.SetBasicAuth(*harborUsername, *harborPassword)
+	artifactReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 	artifactResp, err := httpClient.Do(artifactReq)
 	if err != nil {
 		return nil, GetSBOMResult{}, fmt.Errorf("failed to get artifact details: %w", err)
@@ -387,14 +387,14 @@ func GetSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetSBOMParams) 
 
 	// 2. Download the SBOM using the digest.
 	sbomURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/sbom",
-		*harborURL, args.Project, repo, artifact.Digest)
+		*privateRegistryURL, args.Project, repo, artifact.Digest)
 	log.Printf("Downloading SBOM from: %s", sbomURL)
 
 	sbomReq, err := http.NewRequestWithContext(ctx, "GET", sbomURL, nil)
 	if err != nil {
 		return nil, GetSBOMResult{}, fmt.Errorf("failed to create SBOM download request: %w", err)
 	}
-	sbomReq.SetBasicAuth(*harborUsername, *harborPassword)
+	sbomReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 	// The API returns a JSON response that contains the SBOM as a raw JSON object.
 	sbomReq.Header.Set("Accept", "application/json")
 
@@ -410,13 +410,13 @@ func GetSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetSBOMParams) 
 		// SBOM does not exist, we need to trigger a scan.
 		log.Printf("SBOM not found for %s. Triggering a scan.", artifact.Digest)
 		scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
-			*harborURL, args.Project, repo, args.Tag)
+			*privateRegistryURL, args.Project, repo, args.Tag)
 		scanPayload := strings.NewReader(`{"scan_type": "sbom"}`)
 		scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, scanPayload)
 		if err != nil {
 			return nil, GetSBOMResult{}, fmt.Errorf("failed to create scan request: %w", err)
 		}
-		scanReq.SetBasicAuth(*harborUsername, *harborPassword)
+		scanReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 		scanReq.Header.Set("Content-Type", "application/json")
 		scanReq.Header.Set("X-Accept-Vulnerabilities", "application/vnd.security.vulnerability.report; version=1.1, application/vnd.cyclonedx+json; version=1.4")
 
@@ -448,14 +448,14 @@ func GetSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetSBOMParams) 
 	} else {
 		body, _ := io.ReadAll(sbomResp.Body)
 		sbomResp.Body.Close()
-		// Check for a specific Harbor limitation with Docker v2 manifests.
+		// Check for a specific Private Registry limitation with Docker v2 manifests.
 		if strings.Contains(string(body), "SBOM isn't supported for IMAGE") {
 			// Construct the UI link for the SBOM
-			uiLink := fmt.Sprintf("%s/harbor/projects/1/repositories/%s/artifacts-tab/artifacts/%s?tab=sbom", strings.TrimSuffix(*harborURL, "/api/v2.0"), args.Repository, artifact.Digest)
+			uiLink := fmt.Sprintf("%s/mcp-spr/projects/1/repositories/%s/artifacts-tab/artifacts/%s?tab=sbom", strings.TrimSuffix(*privateRegistryURL, "/api/v2.0"), args.Repository, artifact.Digest)
 			imageName := fmt.Sprintf("%s/%s:%s", args.Project, args.Repository, args.Tag)
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: fmt.Sprintf("Harbor does not support SBOM generation for image %s because it uses an older manifest format (Docker v2). However, the SBOM may be available in the Harbor UI at: %s", imageName, uiLink)},
+					&mcp.TextContent{Text: fmt.Sprintf("SUSE Private Registry does not support SBOM generation for image %s because it uses an older manifest format (Docker v2). However, the SBOM may be available in the privateRegistry UI at: %s", imageName, uiLink)},
 				},
 			}, GetSBOMResult{ImageName: imageName, SBOMURL: uiLink}, nil
 		}
@@ -480,10 +480,10 @@ found:
 	}, result, nil
 }
 
-// GetProjectSBOM retrieves the Software Bill of Materials (SBOM) for all images in a specific Harbor project.
+// GetProjectSBOM retrieves the Software Bill of Materials (SBOM) for all images in a specific privateRegistry project.
 func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProjectSBOMParams) (*mcp.CallToolResult, GetProjectSBOMResult, error) {
-	if *harborPassword == "" {
-		return nil, GetProjectSBOMResult{}, fmt.Errorf("harbor-password flag is not set")
+	if *privateRegistryPassword == "" {
+		return nil, GetProjectSBOMResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 	if args.Project == "" {
 		return nil, GetProjectSBOMResult{}, fmt.Errorf("project is a required parameter")
@@ -503,12 +503,12 @@ func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProje
 
 	// 1. List repositories in the project
 	log.Printf("Starting SBOM retrieval for project: %s", args.Project)
-	reposURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories", *harborURL, args.Project)
+	reposURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories", *privateRegistryURL, args.Project)
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", reposURL, nil)
 	if err != nil {
 		return nil, GetProjectSBOMResult{}, fmt.Errorf("failed to create list repositories request: %w", err)
 	}
-	httpReq.SetBasicAuth(*harborUsername, *harborPassword)
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 
 	repoResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -538,13 +538,13 @@ func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProje
 		repoNameOnly := strings.TrimPrefix(repo.Name, args.Project+"/")
 		repoNameEncoded := strings.ReplaceAll(repoNameOnly, "/", "%2F")
 
-		artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts", *harborURL, args.Project, repoNameEncoded)
+		artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts", *privateRegistryURL, args.Project, repoNameEncoded)
 		artifactsReq, err := http.NewRequestWithContext(ctx, "GET", artifactsURL, nil)
 		if err != nil {
 			log.Printf("Error creating artifacts request for %s: %v", repo.Name, err)
 			continue
 		}
-		artifactsReq.SetBasicAuth(*harborUsername, *harborPassword)
+		artifactsReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 
 		artifactsResp, err := httpClient.Do(artifactsReq)
 		if err != nil {
@@ -578,7 +578,7 @@ func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProje
 			// Trigger an SBOM scan for the image artifact.
 			log.Printf("Triggering SBOM scan for image: %s:%s", repo.Name, tag)
 			scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
-				*harborURL, args.Project, repoNameEncoded, tag)
+				*privateRegistryURL, args.Project, repoNameEncoded, tag)
 
 			scanPayload := strings.NewReader(`{"scan_type": "sbom"}`)
 			scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, scanPayload)
@@ -586,7 +586,7 @@ func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProje
 				log.Printf("Error creating SBOM scan request for %s:%s: %v", repo.Name, tag, err)
 				continue
 			}
-			scanReq.SetBasicAuth(*harborUsername, *harborPassword)
+			scanReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 			scanReq.Header.Set("Content-Type", "application/json")
 			scanReq.Header.Set("X-Accept-Vulnerabilities", "application/vnd.cyclonedx+json; version=1.4")
 
@@ -610,15 +610,15 @@ func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProje
 	}, GetProjectSBOMResult{}, nil
 }
 
-// ScanProject scans all images in a given Harbor project and returns a summary of vulnerabilities.
+// ScanProject scans all images in a given Private Registry project and returns a summary of vulnerabilities.
 func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProjectParams) (*mcp.CallToolResult, ScanProjectResult, error) {
-	if *harborPassword == "" {
+	if *privateRegistryPassword == "" {
 		// It's good practice to log when returning an error.
-		log.Println("Error: harbor-password flag is not set.")
-		return nil, ScanProjectResult{}, fmt.Errorf("harbor-password flag is not set")
+		log.Println("Error: private-registry-password flag is not set.")
+		return nil, ScanProjectResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 	if args.Project == "" {
-		return nil, ScanProjectResult{}, fmt.Errorf("harbor-password flag is not set")
+		return nil, ScanProjectResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 
 	// Sanitize string inputs.
@@ -635,12 +635,12 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 
 	// 1. List repositories in the project
 	log.Printf("Starting scan for project: %s", args.Project)
-	reposURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories", *harborURL, args.Project)
+	reposURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories", *privateRegistryURL, args.Project)
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", reposURL, nil)
 	if err != nil {
 		return nil, ScanProjectResult{}, fmt.Errorf("failed to create list repositories request: %w", err)
 	}
-	httpReq.SetBasicAuth(*harborUsername, *harborPassword)
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 
 	repoResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -666,18 +666,18 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 
 	// 2. For each repository, list artifacts and get vulnerability summaries
 	for _, repo := range repositories {
-		// Harbor repo names include the project, e.g., "my-project/my-repo". We need the part after the slash.
+		// Private Registry repo names include the project, e.g., "my-project/my-repo". We need the part after the slash.
 		log.Printf("Processing repository: %s", repo.Name)
 		repoNameOnly := strings.TrimPrefix(repo.Name, args.Project+"/")
 		repoNameEncoded := strings.ReplaceAll(repoNameOnly, "/", "%2F")
 
-		artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts", *harborURL, args.Project, repoNameEncoded)
+		artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts", *privateRegistryURL, args.Project, repoNameEncoded)
 		artifactsReq, err := http.NewRequestWithContext(ctx, "GET", artifactsURL, nil)
 		if err != nil {
 			log.Printf("Error creating artifacts request for %s: %v", repo.Name, err)
 			continue
 		}
-		artifactsReq.SetBasicAuth(*harborUsername, *harborPassword)
+		artifactsReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 
 		artifactsResp, err := httpClient.Do(artifactsReq)
 		if err != nil {
@@ -716,7 +716,7 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 			// 4. Trigger a scan for the image artifact.
 			log.Printf("Triggering scan for image: %s:%s", repo.Name, tag)
 			scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
-				*harborURL, args.Project, repoNameEncoded, tag)
+				*privateRegistryURL, args.Project, repoNameEncoded, tag)
 
 			// Include "vulnerability" in the scan request.
 			scanPayload := strings.NewReader(`{"scan_type": "vulnerability"}`)
@@ -725,7 +725,7 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 				log.Printf("Error creating scan request for %s:%s: %v", repo.Name, tag, err)
 				continue
 			}
-			scanReq.SetBasicAuth(*harborUsername, *harborPassword)
+			scanReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 			scanReq.Header.Set("Content-Type", "application/json")
 
 			scanResp, err := httpClient.Do(scanReq)
@@ -741,9 +741,9 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 			// 5. Poll for the scan report.
 			log.Printf("Polling for scan report for %s:%s...", repo.Name, tag)
 			reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities",
-				*harborURL, args.Project, repoNameEncoded, tag)
+				*privateRegistryURL, args.Project, repoNameEncoded, tag)
 
-			var reportData map[string]HarborVulnerabilityReport
+			var reportData map[string]privateRegistryVulnerabilityReport
 			var reportFound bool
 			for i := 0; i < 60; i++ { // Poll up to 60 times
 				time.Sleep(3 * time.Second) // Wait before checking
@@ -753,7 +753,7 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 					log.Printf("Error creating report request for %s:%s: %v", repo.Name, tag, err)
 					break // Stop polling for this image on error
 				}
-				reportReq.SetBasicAuth(*harborUsername, *harborPassword)
+				reportReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 				reportReq.Header.Set("Accept", "application/json")
 
 				reportResp, err := httpClient.Do(reportReq)
@@ -811,10 +811,10 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 }
 
 // FindPatchedImage searches for a newer version of an image without a specific CVE.
-// It searches in the local Harbor, then registry.suse.com, and finally Docker Hub.
+// It searches in the local Private Registry, then registry.suse.com, and finally Docker Hub.
 func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPatchedImageParams) (*mcp.CallToolResult, FindPatchedImageResult, error) {
-	if *harborPassword == "" {
-		return nil, FindPatchedImageResult{}, fmt.Errorf("harbor-password flag is not set")
+	if *privateRegistryPassword == "" {
+		return nil, FindPatchedImageResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
 	if args.Project == "" || args.Repository == "" || args.Tag == "" || args.CVEID == "" {
 		return nil, FindPatchedImageResult{}, fmt.Errorf("project, repository, tag, and cve_id are required parameters")
@@ -835,17 +835,17 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 		},
 	}
 
-	// 1. Search in the local Harbor instance.
+	// 1. Search in the local Private Registry instance.
 	log.Printf("[%s] START: Searching for patched image for %s/%s:%s (CVE: %s)", time.Now().Format(time.RFC3339), args.Repository, args.Tag, args.CVEID)
 	repoNameEncoded := strings.ReplaceAll(args.Repository, "/", "%2F")
-	artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts?with_tag=true", *harborURL, args.Project, repoNameEncoded)
+	artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts?with_tag=true", *privateRegistryURL, args.Project, repoNameEncoded)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", artifactsURL, nil)
 	if err != nil {
 		return nil, FindPatchedImageResult{}, fmt.Errorf("failed to create list artifacts request: %w", err)
 	}
-	httpReq.SetBasicAuth(*harborUsername, *harborPassword)
-	log.Printf("[%s] Step 1/3: Searching local Harbor artifacts at %s", time.Now().Format(time.RFC3339), artifactsURL)
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+	log.Printf("[%s] Step 1/3: Searching local Private Registry artifacts at %s", time.Now().Format(time.RFC3339), artifactsURL)
 
 	artifactsResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -857,7 +857,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 		body, _ := io.ReadAll(artifactsResp.Body)
 		return nil, FindPatchedImageResult{}, fmt.Errorf("failed to list artifacts, status %d: %s", artifactsResp.StatusCode, string(body))
 	}
-	log.Printf("[%s] Harbor artifact search returned status %d", time.Now().Format(time.RFC3339), artifactsResp.StatusCode)
+	log.Printf("[%s] Private Registry artifact search returned status %d", time.Now().Format(time.RFC3339), artifactsResp.StatusCode)
 
 	type Artifact struct {
 		Type     string    `json:"type"`
@@ -871,7 +871,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	if err := json.NewDecoder(artifactsResp.Body).Decode(&artifacts); err != nil {
 		return nil, FindPatchedImageResult{}, fmt.Errorf("failed to decode artifacts list: %w", err)
 	}
-	log.Printf("[%s] Found %d total artifacts in local Harbor to evaluate.", time.Now().Format(time.RFC3339), len(artifacts))
+	log.Printf("[%s] Found %d total artifacts in local Private Registry to evaluate.", time.Now().Format(time.RFC3339), len(artifacts))
 
 	var originalArtifact Artifact
 	for _, artifact := range artifacts {
@@ -895,14 +895,14 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	var originalVulnCount struct{ Critical, High int }
 	if originalArtifact.Digest != "" {
 		log.Printf("Getting vulnerability summary for original image %s:%s", args.Repository, args.Tag)
-		reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities", *harborURL, args.Project, repoNameEncoded, originalArtifact.Tags[0].Name)
+		reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities", *privateRegistryURL, args.Project, repoNameEncoded, originalArtifact.Tags[0].Name)
 		reportReq, _ := http.NewRequestWithContext(ctx, "GET", reportURL, nil)
-		reportReq.SetBasicAuth(*harborUsername, *harborPassword)
+		reportReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 		reportReq.Header.Set("Accept", "application/json")
 
 		reportResp, err := httpClient.Do(reportReq)
 		if err == nil && reportResp.StatusCode == http.StatusOK {
-			var reportData map[string]HarborVulnerabilityReport
+			var reportData map[string]privateRegistryVulnerabilityReport
 			if err := json.NewDecoder(reportResp.Body).Decode(&reportData); err == nil {
 				for _, report := range reportData {
 					for _, vuln := range report.Vulnerabilities {
@@ -931,7 +931,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	}
 
 	newerTags := findNewerTags(localTags, args.Tag)
-	log.Printf("Found %d newer tags in local Harbor to check: %v", len(newerTags), newerTags)
+	log.Printf("Found %d newer tags in local Private Registry to check: %v", len(newerTags), newerTags)
 
 	for _, tag := range newerTags {
 		// Find the artifact corresponding to the newer tag.
@@ -947,9 +947,9 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 		}
 
 		log.Printf("Checking local image %s:%s", args.Repository, tag)
-		reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities", *harborURL, args.Project, repoNameEncoded, tag)
+		reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities", *privateRegistryURL, args.Project, repoNameEncoded, tag)
 		reportReq, _ := http.NewRequestWithContext(ctx, "GET", reportURL, nil)
-		reportReq.SetBasicAuth(*harborUsername, *harborPassword)
+		reportReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 		reportReq.Header.Set("Accept", "application/json")
 
 		reportResp, err := httpClient.Do(reportReq)
@@ -963,7 +963,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 			continue
 		}
 
-		var reportData map[string]HarborVulnerabilityReport
+		var reportData map[string]privateRegistryVulnerabilityReport
 		if err := json.NewDecoder(reportResp.Body).Decode(&reportData); err != nil {
 			reportResp.Body.Close()
 			continue
@@ -1003,15 +1003,15 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 		}
 
 		if !cveFound {
-			imageName := fmt.Sprintf("%s/%s/%s:%s", *harborURL, args.Project, args.Repository, tag)
+			imageName := fmt.Sprintf("%s/%s/%s:%s", *privateRegistryURL, args.Project, args.Repository, tag)
 			result := FindPatchedImageResult{
 				Found:         true,
 				Image:         imageName,
-				Location:      "local-harbor",
+				Location:      "local-private-registry",
 				CriticalCount: candidateVulnCount.Critical,
 				HighCount:     candidateVulnCount.High,
 			}
-			summaryText := fmt.Sprintf("Found patched image in local Harbor: %s. It has %d Critical and %d High vulnerabilities.", imageName, result.CriticalCount, result.HighCount)
+			summaryText := fmt.Sprintf("Found patched image in local Private Registry: %s. It has %d Critical and %d High vulnerabilities.", imageName, result.CriticalCount, result.HighCount)
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: summaryText}},
 			}, result, nil
@@ -1032,8 +1032,8 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	if lastSlash := strings.LastIndex(baseRepoName, "/"); lastSlash != -1 {
 		baseRepoName = baseRepoName[lastSlash+1:]
 	}
-	// 2. Search registry.suse.com by using Harbor as a proxy cache.
-	log.Printf("[%s] Step 2/3: Patched image not found in local Harbor. Searching registry.suse.com for '%s'", time.Now().Format(time.RFC3339), baseRepoName)
+	// 2. Search registry.suse.com by using Private Registry as a proxy cache.
+	log.Printf("[%s] Step 2/3: Patched image not found in local Private Registry. Searching registry.suse.com for '%s'", time.Now().Format(time.RFC3339), baseRepoName)
 
 	suseSearchPerformed := false
 	// --- New Direct Lookup Logic ---
@@ -1084,7 +1084,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 					log.Printf("Found %d newer tags for SUSE repo %s: %v", len(newerTags), suseRepoToSearch, newerTags)
 					tagsResp.Body.Close()
 					for _, tag := range newerTags {
-						cveFound, err := scanHarborArtifact(ctx, proxyProjectName, suseRepoToSearch, tag, args.CVEID, httpClient)
+						cveFound, err := scanprivateRegistryArtifact(ctx, proxyProjectName, suseRepoToSearch, tag, args.CVEID, httpClient)
 						if err == nil && !cveFound {
 							imageToScan := fmt.Sprintf("registry.suse.com/%s:%s", suseRepoToSearch, tag)
 							return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in registry.suse.com: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "registry.suse.com"}, nil
@@ -1144,7 +1144,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 			log.Printf("Found %d newer tags for SUSE repo %s to check: %v", len(newerTags), repoName, newerTags)
 			// Now we can scan the image:tag
 			for _, tag := range newerTags {
-				cveFound, err := scanHarborArtifact(ctx, proxyProjectName, repoName, tag, args.CVEID, httpClient)
+				cveFound, err := scanprivateRegistryArtifact(ctx, proxyProjectName, repoName, tag, args.CVEID, httpClient)
 				if err == nil && !cveFound {
 					imageToScan := fmt.Sprintf("registry.suse.com/%s:%s", repoName, tag)
 					return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in registry.suse.com: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "registry.suse.com"}, nil
@@ -1238,7 +1238,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 				break
 			}
 
-			cveFound, err := scanHarborArtifact(ctx, proxyProjectName, repo.RepoName, tag, args.CVEID, httpClient)
+			cveFound, err := scanprivateRegistryArtifact(ctx, proxyProjectName, repo.RepoName, tag, args.CVEID, httpClient)
 			if err == nil && !cveFound {
 				log.Printf("Found patched image in Docker Hub: %s", imageToScan)
 				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found patched image in Docker Hub: %s", imageToScan)}}}, FindPatchedImageResult{Found: true, Image: imageToScan, Location: "docker-hub"}, nil
@@ -1250,15 +1250,15 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	return notFoundResult(args), FindPatchedImageResult{}, nil
 }
 
-// ensureProxyProject checks if a proxy cache project exists in Harbor and creates it if not.
+// ensureProxyProject checks if a proxy cache project exists in Private Registry and creates it if not.
 func ensureProxyProject(ctx context.Context, projectName, upstreamURL string, client *http.Client) error {
 	// Check if project exists
-	projectURL := fmt.Sprintf("%s/api/v2.0/projects/%s", *harborURL, projectName)
+	projectURL := fmt.Sprintf("%s/api/v2.0/projects/%s", *privateRegistryURL, projectName)
 	req, err := http.NewRequestWithContext(ctx, "GET", projectURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create check project request: %w", err)
 	}
-	req.SetBasicAuth(*harborUsername, *harborPassword)
+	req.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to check for project %s: %w", projectName, err)
@@ -1276,7 +1276,7 @@ func ensureProxyProject(ctx context.Context, projectName, upstreamURL string, cl
 
 	// Project does not exist, so create it.
 	log.Printf("Proxy project '%s' not found. Creating it now for upstream %s.", projectName, upstreamURL)
-	createURL := fmt.Sprintf("%s/api/v2.0/projects", *harborURL)
+	createURL := fmt.Sprintf("%s/api/v2.0/projects", *privateRegistryURL)
 	createBody := fmt.Sprintf(`{
         "project_name": "%s",
         "public": false,
@@ -1287,15 +1287,15 @@ func ensureProxyProject(ctx context.Context, projectName, upstreamURL string, cl
 
 	// This is a placeholder. A robust implementation needs to find the ID of the proxy registry endpoint.
 	// For now, we assume the user has set one up and we are just creating the project.
-	// The real power comes from Harbor automatically pulling from the associated endpoint.
-	// Let's just create a normal project and let Harbor's proxy rules handle it.
+	// The real power comes from Private Registry automatically pulling from the associated endpoint.
+	// Let's just create a normal project and let Private Registry's proxy rules handle it.
 	createBody = fmt.Sprintf(`{"project_name": "%s", "public": false}`, projectName)
 
 	createReq, err := http.NewRequestWithContext(ctx, "POST", createURL, strings.NewReader(createBody))
 	if err != nil {
 		return fmt.Errorf("failed to create project creation request: %w", err)
 	}
-	createReq.SetBasicAuth(*harborUsername, *harborPassword)
+	createReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 	createReq.Header.Set("Content-Type", "application/json")
 
 	createResp, err := client.Do(createReq)
@@ -1313,14 +1313,14 @@ func ensureProxyProject(ctx context.Context, projectName, upstreamURL string, cl
 	return nil
 }
 
-// scanHarborArtifact triggers a scan for an artifact within Harbor and checks for a CVE.
-func scanHarborArtifact(ctx context.Context, project, repo, tag, cveID string, client *http.Client) (bool, error) {
+// scanprivateRegistryArtifact triggers a scan for an artifact within Private Registry and checks for a CVE.
+func scanprivateRegistryArtifact(ctx context.Context, project, repo, tag, cveID string, client *http.Client) (bool, error) {
 	repoNameEncoded := strings.ReplaceAll(repo, "/", "%2F")
 
 	// Trigger scan
-	scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan", *harborURL, project, repoNameEncoded, tag)
+	scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan", *privateRegistryURL, project, repoNameEncoded, tag)
 	scanReq, _ := http.NewRequestWithContext(ctx, "POST", scanURL, nil)
-	scanReq.SetBasicAuth(*harborUsername, *harborPassword)
+	scanReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 	scanResp, err := client.Do(scanReq)
 	if err != nil {
 		return false, fmt.Errorf("failed to trigger scan on %s/%s:%s: %w", project, repo, tag, err)
@@ -1328,11 +1328,11 @@ func scanHarborArtifact(ctx context.Context, project, repo, tag, cveID string, c
 	scanResp.Body.Close()
 
 	// Poll for results
-	reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities", *harborURL, project, repoNameEncoded, tag)
+	reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities", *privateRegistryURL, project, repoNameEncoded, tag)
 	for i := 0; i < 60; i++ {
 		time.Sleep(5 * time.Second)
 		reportReq, _ := http.NewRequestWithContext(ctx, "GET", reportURL, nil)
-		reportReq.SetBasicAuth(*harborUsername, *harborPassword)
+		reportReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
 		reportReq.Header.Set("Accept", "application/json")
 		reportResp, err := client.Do(reportReq)
 		if err != nil {
@@ -1340,7 +1340,7 @@ func scanHarborArtifact(ctx context.Context, project, repo, tag, cveID string, c
 		}
 
 		if reportResp.StatusCode == http.StatusOK {
-			var reportData map[string]HarborVulnerabilityReport
+			var reportData map[string]privateRegistryVulnerabilityReport
 			if err := json.NewDecoder(reportResp.Body).Decode(&reportData); err != nil {
 				reportResp.Body.Close()
 				continue
@@ -1366,7 +1366,7 @@ func notFoundResult(args FindPatchedImageParams) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
 			&mcp.TextContent{
-				Text: fmt.Sprintf("Could not find a patched version for %s/%s:%s without CVE %s in local Harbor, registry.suse.com, or Docker Hub.",
+				Text: fmt.Sprintf("Could not find a patched version for %s/%s:%s without CVE %s in local Private Registry, registry.suse.com, or Docker Hub.",
 					args.Project, args.Repository, args.Tag, args.CVEID),
 			},
 		},
@@ -1461,37 +1461,37 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEndpoints:\n")
-		fmt.Fprintf(os.Stderr, "  /harbor   - Harbor scanning service\n")
+		fmt.Fprintf(os.Stderr, "  /mpc-spr   - Private Registry scanning service\n")
 		os.Exit(1)
 	}
 	flag.Parse()
 
 	addr := fmt.Sprintf("%s:%s", *host, *port)
 
-	harborServer := mcp.NewServer(&mcp.Implementation{Name: "harbor-scanner"}, nil)
-	mcp.AddTool(harborServer, &mcp.Tool{
+	privateRegistryServer := mcp.NewServer(&mcp.Implementation{Name: "private-registry-scanner"}, nil)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "scan_image",
-		Description: "Scans a container image in Harbor for vulnerabilities using Trivy.",
+		Description: "Scans a container image in Private Registry for vulnerabilities using Trivy.",
 	}, ScanImage)
-	mcp.AddTool(harborServer, &mcp.Tool{
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "scan_project",
-		Description: "Scans all images in a Harbor project and provides a vulnerability summary.",
+		Description: "Scans all images in a Private Registry project and provides a vulnerability summary.",
 	}, ScanProject)
-	mcp.AddTool(harborServer, &mcp.Tool{
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "find_patched_image",
 		Description: "Finds a newer version of an image without a specific CVE.",
 	}, FindPatchedImage)
-	mcp.AddTool(harborServer, &mcp.Tool{
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_vulnerabilities",
-		Description: "Retrieves all vulnerabilities for a specific container image from Harbor.",
+		Description: "Retrieves all vulnerabilities for a specific container image from Private Registry.",
 	}, GetVulnerabilities)
-	mcp.AddTool(harborServer, &mcp.Tool{
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_sbom",
-		Description: "Retrieves the Software Bill of Materials (SBOM) for a specific container image from Harbor.",
+		Description: "Retrieves the Software Bill of Materials (SBOM) for a specific container image from privateRegistry.",
 	}, GetSBOM)
-	mcp.AddTool(harborServer, &mcp.Tool{
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_project_sbom",
-		Description: "Retrieves the Software Bill of Materials (SBOM) for all images in a Harbor project.",
+		Description: "Retrieves the Software Bill of Materials (SBOM) for all images in a privateRegistry project.",
 	}, GetProjectSBOM)
 
 	log.Printf("MCP servers serving at %s", addr)
@@ -1499,8 +1499,8 @@ func main() {
 		func(request *http.Request) *mcp.Server {
 			url := request.URL.Path
 			log.Printf("Handling request for URL %s\n", url)
-			if url == "/harbor" {
-				return harborServer
+			if url == "/mpc-spr" {
+				return privateRegistryServer
 			}
 			return nil
 		},

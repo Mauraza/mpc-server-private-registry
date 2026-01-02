@@ -6,7 +6,7 @@ Think of it like asking a smart assistant: *"Hey, are there any critical vulnera
 
 ## Overview
 
-This project runs a simple web server that listens for requests on the `/harbor` endpoint. When an AI assistant sends a request, the server translates it into actions for your Harbor registry, like starting a vulnerability scan or checking for patched images.
+This project runs a simple web server that listens for requests on the `/mpv-spr` endpoint. When an AI assistant sends a request, the server translates it into actions for your Harbor registry, like starting a vulnerability scan or checking for patched images.
 
 The server relies on command-line flags for its configuration, including Harbor's URL and credentials.
 
@@ -20,17 +20,17 @@ The server relies on command-line flags for its configuration, including Harbor'
 
 The required Go packages will be downloaded automatically when you build or run the application for the first time.
 
-To run the server, you need to provide the Harbor instance details via command-line flags.
+To run the server, you need to provide the Private Registry based on Harbor instance details via command-line flags.
 
 ```bash
 # Example of running the server
 go run main.go \
-  --harbor-url "https://your-harbor-instance.com" \
-  --harbor-username "your-user" \
-  --harbor-password "your-password"
+  --private-registry-url "https://your-private-registry-instance.com" \
+  --private-registry-username "your-user" \
+  --private-registry-password "your-password"
 ```
 
-The server will start on `localhost:8080` by default. The MCP endpoint will be available at `http://localhost:8080/harbor`.
+The server will start on `localhost:8080` by default. The MCP endpoint will be available at `http://localhost:8080/mpv-spr`.
 
 ## Display capture
 
