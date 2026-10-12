@@ -6,7 +6,7 @@ Think of it like asking a smart assistant: *"Hey, are there any critical vulnera
 
 ## Overview
 
-This project runs a simple web server that listens for requests on the `/mpv-spr` endpoint. When an AI assistant sends a request, the server translates it into actions for your Harbor registry, like starting a vulnerability scan or checking for patched images.
+This project runs a simple web server that listens for requests on the `/mpc-spr` endpoint. When an AI assistant sends a request, the server translates it into actions for your Harbor registry, like starting a vulnerability scan or checking for patched images.
 
 The server relies on command-line flags for its configuration, including Harbor's URL and credentials.
 
@@ -14,7 +14,7 @@ The server relies on command-line flags for its configuration, including Harbor'
 
 ### Prerequisites
 
-* **Go**: Version 1.18 or newer.
+* **Go**: Version 1.25 or newer.
 * **cURL**: Used for testing and interacting with the MCP server from the command line.
 * **Crane**: A command-line tool for interacting with container registries. It's useful for managing images outside the MCP server.
 
@@ -30,7 +30,7 @@ go run main.go \
   --private-registry-password "your-password"
 ```
 
-The server will start on `localhost:8080` by default. The MCP endpoint will be available at `http://localhost:8080/mpv-spr`.
+The server will start on `localhost:8080` by default. The MCP endpoint will be available at `http://localhost:8080/mpc-spr`.
 
 ## Display capture
 
@@ -81,3 +81,48 @@ The server exposes several tools that can be called via the MCP protocol:
     4. It checks if the specified `cve_id` is present in the report.
     5. Returns the first newer image found that doesn't have the CVE.
 * **Parameters**: `project`, `repository`, `tag`, `cve_id`.
+
+### 4. `get_vulnerabilities`
+
+* **What it does**: Retrieves the existing vulnerability report for an image without triggering a new scan.
+* **Parameters**: `project`, `repository`, `tag`.
+
+### 5. `get_sbom`
+
+* **What it does**: Retrieves (triggering a scan if necessary) the Software Bill of Materials (SBOM) for a single image.
+* **Parameters**: `project`, `repository`, `tag`.
+
+### 6. `get_project_sbom`
+
+* **What it does**: Triggers SBOM generation for every image in a project (fire-and-forget; doesn't wait for or return the generated SBOMs).
+* **Parameters**: `project`.
+
+### 7. `list_projects`
+
+* **What it does**: Lists all projects visible in the private registry.
+* **Parameters**: none.
+
+### 8. `get_project`
+
+* **What it does**: Retrieves details (repository count, creation time) for a single project by name.
+* **Parameters**: `project`.
+
+### 9. `list_repositories`
+
+* **What it does**: Lists all repositories within a project.
+* **Parameters**: `project`.
+
+### 10. `list_tags`
+
+* **What it does**: Lists all tags of artifacts within a repository, along with each artifact's type.
+* **Parameters**: `project`, `repository`.
+
+### 11. `list_charts`
+
+* **What it does**: Lists Helm charts in a project. Relies on Harbor's legacy chart repository (ChartMuseum-backed) API, which is disabled by default on Harbor 2.11+.
+* **Parameters**: `project`.
+
+### 12. `list_chart_versions`
+
+* **What it does**: Lists versions of a single Helm chart. Has the same Harbor chart-repository-support caveat as `list_charts`.
+* **Parameters**: `project`, `chart`.

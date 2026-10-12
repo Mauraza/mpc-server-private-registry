@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-version"
@@ -25,12 +26,28 @@ import (
 )
 
 var (
-	host           = flag.String("host", "localhost", "host to listen on")
-	port           = flag.String("port", "8080", "port to listen on")
+	host                    = flag.String("host", "localhost", "host to listen on")
+	port                    = flag.String("port", "8080", "port to listen on")
 	privateRegistryURL      = flag.String("private-registry-url", "http://localhost:8081", "Private Registry instance URL")
 	privateRegistryUsername = flag.String("private-registry-username", "admin", "Private Registry username for API access")
 	privateRegistryPassword = flag.String("private-registry-password", "", "Private Registry password for API access")
+	// Timeout for long-running scans (independent of the client's context)
+	scanTimeout      = flag.Duration("scan-timeout", 30*time.Minute, "maximum time to wait for a project scan")
+	progressInterval = flag.Duration("progress-interval", 30*time.Second, "interval between progress notifications while scanning")
 )
+
+// newPrivateRegistryHTTPClient builds an HTTP client configured to talk to the
+// Private Registry instance, matching the TLS settings used by the other tools.
+func newPrivateRegistryHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // Allow insecure TLS when explicitly requested
+			},
+		},
+	}
+}
 
 // ScanImageParams defines the input for the privateRegistry image scanning tool.
 type ScanImageParams struct {
@@ -143,6 +160,99 @@ type SBOMInfo struct {
 type GetProjectSBOMResult struct {
 }
 
+// ListProjectsParams defines the input for the tool that lists registry projects. It takes no parameters.
+type ListProjectsParams struct {
+}
+
+// ProjectInfo describes a single Private Registry project.
+type ProjectInfo struct {
+	Name         string `json:"name"`
+	RepoCount    int    `json:"repo_count,omitempty"`
+	CreationTime string `json:"creation_time,omitempty"`
+}
+
+// ListProjectsResult is the output of the list_projects tool.
+type ListProjectsResult struct {
+	Projects []ProjectInfo `json:"projects"`
+}
+
+// GetProjectParams defines the input for the tool that fetches a single project's details.
+type GetProjectParams struct {
+	Project string `json:"project" jsonschema:"The Private Registry project name"`
+}
+
+// GetProjectResult is the output of the get_project tool.
+type GetProjectResult struct {
+	Found   bool        `json:"found"`
+	Project ProjectInfo `json:"project"`
+}
+
+// ListRepositoriesParams defines the input for the tool that lists repositories in a project.
+type ListRepositoriesParams struct {
+	Project string `json:"project" jsonschema:"The Private Registry project name"`
+}
+
+// RepositoryInfo describes a single repository within a project.
+type RepositoryInfo struct {
+	Name          string `json:"name"`
+	ArtifactCount int    `json:"artifact_count,omitempty"`
+}
+
+// ListRepositoriesResult is the output of the list_repositories tool.
+type ListRepositoriesResult struct {
+	Repositories []RepositoryInfo `json:"repositories"`
+}
+
+// ListTagsParams defines the input for the tool that lists tags in a repository.
+type ListTagsParams struct {
+	Project    string `json:"project" jsonschema:"The Private Registry project name"`
+	Repository string `json:"repository" jsonschema:"The repository name within the project"`
+}
+
+// TagInfo describes a single tag of an artifact within a repository.
+type TagInfo struct {
+	Name         string `json:"name"`
+	ArtifactType string `json:"artifact_type,omitempty"`
+}
+
+// ListTagsResult is the output of the list_tags tool.
+type ListTagsResult struct {
+	Tags []TagInfo `json:"tags"`
+}
+
+// ListChartsParams defines the input for the tool that lists Helm charts in a project.
+type ListChartsParams struct {
+	Project string `json:"project" jsonschema:"The Private Registry project name"`
+}
+
+// ChartInfo describes a single Helm chart.
+type ChartInfo struct {
+	Name          string `json:"name"`
+	LatestVersion string `json:"latest_version,omitempty"`
+}
+
+// ListChartsResult is the output of the list_charts tool.
+type ListChartsResult struct {
+	Charts []ChartInfo `json:"charts"`
+}
+
+// ListChartVersionsParams defines the input for the tool that lists versions of a Helm chart.
+type ListChartVersionsParams struct {
+	Project string `json:"project" jsonschema:"The Private Registry project name"`
+	Chart   string `json:"chart" jsonschema:"The Helm chart name"`
+}
+
+// ChartVersionInfo describes a single version of a Helm chart.
+type ChartVersionInfo struct {
+	Version    string `json:"version"`
+	AppVersion string `json:"app_version,omitempty"`
+}
+
+// ListChartVersionsResult is the output of the list_chart_versions tool.
+type ListChartVersionsResult struct {
+	Versions []ChartVersionInfo `json:"versions"`
+}
+
 // ScanImage is a tool handler that triggers a vulnerability scan in Private Registry for a given
 // container image and returns the results.
 func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImageParams) (*mcp.CallToolResult, ScanResult, error) {
@@ -167,6 +277,7 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 		*privateRegistryURL, args.Project, repo, args.Tag)
 
 	httpClient := &http.Client{
+		Timeout: 3 * time.Minute,
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{
@@ -610,6 +721,321 @@ func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProje
 	}, GetProjectSBOMResult{}, nil
 }
 
+// ListProjects lists all projects visible in the Private Registry.
+func ListProjects(ctx context.Context, req *mcp.CallToolRequest, args ListProjectsParams) (*mcp.CallToolResult, ListProjectsResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, ListProjectsResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+
+	httpClient := newPrivateRegistryHTTPClient()
+
+	projectsURL := fmt.Sprintf("%s/api/v2.0/projects", *privateRegistryURL)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", projectsURL, nil)
+	if err != nil {
+		return nil, ListProjectsResult{}, fmt.Errorf("failed to create list projects request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, ListProjectsResult{}, fmt.Errorf("failed to list projects: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, ListProjectsResult{}, fmt.Errorf("failed to list projects, status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type harborProject struct {
+		Name         string `json:"name"`
+		RepoCount    int    `json:"repo_count"`
+		CreationTime string `json:"creation_time"`
+	}
+	var projects []harborProject
+	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
+		return nil, ListProjectsResult{}, fmt.Errorf("failed to decode projects list: %w", err)
+	}
+
+	result := ListProjectsResult{Projects: make([]ProjectInfo, 0, len(projects))}
+	for _, p := range projects {
+		result.Projects = append(result.Projects, ProjectInfo{Name: p.Name, RepoCount: p.RepoCount, CreationTime: p.CreationTime})
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d projects.", len(result.Projects))}},
+	}, result, nil
+}
+
+// GetProject fetches details for a single Private Registry project by name.
+func GetProject(ctx context.Context, req *mcp.CallToolRequest, args GetProjectParams) (*mcp.CallToolResult, GetProjectResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, GetProjectResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	if args.Project == "" {
+		return nil, GetProjectResult{}, fmt.Errorf("project is a required parameter")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+
+	httpClient := newPrivateRegistryHTTPClient()
+
+	// Search by name rather than fetching by ID to avoid Harbor's ID-vs-name
+	// resolution header (X-Is-Resource-Name).
+	projectsURL := fmt.Sprintf("%s/api/v2.0/projects?name=%s", *privateRegistryURL, url.QueryEscape(args.Project))
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", projectsURL, nil)
+	if err != nil {
+		return nil, GetProjectResult{}, fmt.Errorf("failed to create get project request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, GetProjectResult{}, fmt.Errorf("failed to get project: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, GetProjectResult{}, fmt.Errorf("failed to get project, status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type harborProject struct {
+		Name         string `json:"name"`
+		RepoCount    int    `json:"repo_count"`
+		CreationTime string `json:"creation_time"`
+	}
+	var projects []harborProject
+	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
+		return nil, GetProjectResult{}, fmt.Errorf("failed to decode project: %w", err)
+	}
+
+	for _, p := range projects {
+		if p.Name == args.Project {
+			result := GetProjectResult{Found: true, Project: ProjectInfo{Name: p.Name, RepoCount: p.RepoCount, CreationTime: p.CreationTime}}
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found project %s.", p.Name)}},
+			}, result, nil
+		}
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Project %s not found.", args.Project)}},
+	}, GetProjectResult{Found: false}, nil
+}
+
+// ListRepositories lists all repositories within a Private Registry project.
+func ListRepositories(ctx context.Context, req *mcp.CallToolRequest, args ListRepositoriesParams) (*mcp.CallToolResult, ListRepositoriesResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, ListRepositoriesResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	if args.Project == "" {
+		return nil, ListRepositoriesResult{}, fmt.Errorf("project is a required parameter")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+
+	httpClient := newPrivateRegistryHTTPClient()
+
+	reposURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories", *privateRegistryURL, args.Project)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", reposURL, nil)
+	if err != nil {
+		return nil, ListRepositoriesResult{}, fmt.Errorf("failed to create list repositories request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, ListRepositoriesResult{}, fmt.Errorf("failed to list repositories: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, ListRepositoriesResult{}, fmt.Errorf("failed to list repositories, status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type harborRepository struct {
+		Name          string `json:"name"`
+		ArtifactCount int    `json:"artifact_count"`
+	}
+	var repositories []harborRepository
+	if err := json.NewDecoder(resp.Body).Decode(&repositories); err != nil {
+		return nil, ListRepositoriesResult{}, fmt.Errorf("failed to decode repositories list: %w", err)
+	}
+
+	result := ListRepositoriesResult{Repositories: make([]RepositoryInfo, 0, len(repositories))}
+	for _, r := range repositories {
+		result.Repositories = append(result.Repositories, RepositoryInfo{Name: r.Name, ArtifactCount: r.ArtifactCount})
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d repositories in project %s.", len(result.Repositories), args.Project)}},
+	}, result, nil
+}
+
+// ListTags lists all tags of artifacts within a repository.
+func ListTags(ctx context.Context, req *mcp.CallToolRequest, args ListTagsParams) (*mcp.CallToolResult, ListTagsResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, ListTagsResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	if args.Project == "" || args.Repository == "" {
+		return nil, ListTagsResult{}, fmt.Errorf("project and repository are required parameters")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+	args.Repository = strings.TrimSpace(args.Repository)
+
+	httpClient := newPrivateRegistryHTTPClient()
+
+	repoEncoded := strings.ReplaceAll(args.Repository, "/", "%2F")
+	artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts?with_tag=true", *privateRegistryURL, args.Project, repoEncoded)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", artifactsURL, nil)
+	if err != nil {
+		return nil, ListTagsResult{}, fmt.Errorf("failed to create list tags request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, ListTagsResult{}, fmt.Errorf("failed to list tags: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, ListTagsResult{}, fmt.Errorf("failed to list tags, status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type harborArtifact struct {
+		Type string `json:"type"`
+		Tags []struct {
+			Name string `json:"name"`
+		} `json:"tags"`
+	}
+	var artifacts []harborArtifact
+	if err := json.NewDecoder(resp.Body).Decode(&artifacts); err != nil {
+		return nil, ListTagsResult{}, fmt.Errorf("failed to decode artifacts list: %w", err)
+	}
+
+	var tags []TagInfo
+	for _, a := range artifacts {
+		for _, t := range a.Tags {
+			tags = append(tags, TagInfo{Name: t.Name, ArtifactType: a.Type})
+		}
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d tags in %s/%s.", len(tags), args.Project, args.Repository)}},
+	}, ListTagsResult{Tags: tags}, nil
+}
+
+// ListCharts lists Helm charts in a project. This relies on Harbor's legacy chart
+// repository (ChartMuseum-backed) API, which is disabled by default on Harbor 2.11+.
+func ListCharts(ctx context.Context, req *mcp.CallToolRequest, args ListChartsParams) (*mcp.CallToolResult, ListChartsResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, ListChartsResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	if args.Project == "" {
+		return nil, ListChartsResult{}, fmt.Errorf("project is a required parameter")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+
+	httpClient := newPrivateRegistryHTTPClient()
+
+	chartsURL := fmt.Sprintf("%s/api/chartrepo/%s/charts", *privateRegistryURL, args.Project)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", chartsURL, nil)
+	if err != nil {
+		return nil, ListChartsResult{}, fmt.Errorf("failed to create list charts request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, ListChartsResult{}, fmt.Errorf("failed to list charts: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ListChartsResult{}, fmt.Errorf("chart repository API not found (status 404) for project %s; this Harbor instance may not have Helm chart support enabled", args.Project)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, ListChartsResult{}, fmt.Errorf("failed to list charts, status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type harborChart struct {
+		Name   string `json:"name"`
+		Latest struct {
+			Version string `json:"version"`
+		} `json:"latest_version"`
+	}
+	var charts []harborChart
+	if err := json.NewDecoder(resp.Body).Decode(&charts); err != nil {
+		return nil, ListChartsResult{}, fmt.Errorf("failed to decode charts list: %w", err)
+	}
+
+	result := ListChartsResult{Charts: make([]ChartInfo, 0, len(charts))}
+	for _, c := range charts {
+		result.Charts = append(result.Charts, ChartInfo{Name: c.Name, LatestVersion: c.Latest.Version})
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d Helm charts in project %s.", len(result.Charts), args.Project)}},
+	}, result, nil
+}
+
+// ListChartVersions lists versions of a single Helm chart. Like ListCharts, this relies
+// on Harbor's legacy chart repository API, which is disabled by default on Harbor 2.11+.
+func ListChartVersions(ctx context.Context, req *mcp.CallToolRequest, args ListChartVersionsParams) (*mcp.CallToolResult, ListChartVersionsResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, ListChartVersionsResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	if args.Project == "" || args.Chart == "" {
+		return nil, ListChartVersionsResult{}, fmt.Errorf("project and chart are required parameters")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+	args.Chart = strings.TrimSpace(args.Chart)
+
+	httpClient := newPrivateRegistryHTTPClient()
+
+	versionsURL := fmt.Sprintf("%s/api/chartrepo/%s/charts/%s", *privateRegistryURL, args.Project, args.Chart)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", versionsURL, nil)
+	if err != nil {
+		return nil, ListChartVersionsResult{}, fmt.Errorf("failed to create list chart versions request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, ListChartVersionsResult{}, fmt.Errorf("failed to list chart versions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ListChartVersionsResult{}, fmt.Errorf("chart %s not found (status 404) in project %s; this Harbor instance may not have Helm chart support enabled", args.Chart, args.Project)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, ListChartVersionsResult{}, fmt.Errorf("failed to list chart versions, status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type harborChartVersion struct {
+		Version    string `json:"version"`
+		AppVersion string `json:"appVersion"`
+	}
+	var versions []harborChartVersion
+	if err := json.NewDecoder(resp.Body).Decode(&versions); err != nil {
+		return nil, ListChartVersionsResult{}, fmt.Errorf("failed to decode chart versions: %w", err)
+	}
+
+	result := ListChartVersionsResult{Versions: make([]ChartVersionInfo, 0, len(versions))}
+	for _, v := range versions {
+		result.Versions = append(result.Versions, ChartVersionInfo{Version: v.Version, AppVersion: v.AppVersion})
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d versions of chart %s in project %s.", len(result.Versions), args.Chart, args.Project)}},
+	}, result, nil
+}
+
 // ScanProject scans all images in a given Private Registry project and returns a summary of vulnerabilities.
 func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProjectParams) (*mcp.CallToolResult, ScanProjectResult, error) {
 	if *privateRegistryPassword == "" {
@@ -633,10 +1059,51 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 		},
 	}
 
+	// Use an independent operation context so scans continue even if the client
+	// disconnects. Also provide a periodic progress notification to the client.
+	opCtx, cancel := context.WithTimeout(context.Background(), *scanTimeout)
+	defer cancel()
+
+	var totalRepos int
+	var processedRepos int64
+
+	var progressToken interface{}
+	if req != nil {
+		if p, ok := req.GetParams().(mcp.RequestParams); ok {
+			progressToken = p.GetProgressToken()
+		}
+	}
+
+	// Start progress notifier if we have a session to notify.
+	if req != nil && req.GetSession() != nil {
+		go func() {
+			ticker := time.NewTicker(*progressInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-opCtx.Done():
+					return
+				case <-ticker.C:
+					prog := float64(atomic.LoadInt64(&processedRepos))
+					tot := float64(totalRepos)
+					msg := fmt.Sprintf("Processed %d of %d repositories", atomic.LoadInt64(&processedRepos), totalRepos)
+					if ss, ok := req.GetSession().(*mcp.ServerSession); ok {
+						_ = ss.NotifyProgress(context.Background(), &mcp.ProgressNotificationParams{
+							ProgressToken: progressToken,
+							Message:       msg,
+							Progress:      prog,
+							Total:         tot,
+						})
+					}
+				}
+			}
+		}()
+	}
+
 	// 1. List repositories in the project
 	log.Printf("Starting scan for project: %s", args.Project)
 	reposURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories", *privateRegistryURL, args.Project)
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", reposURL, nil)
+	httpReq, err := http.NewRequestWithContext(opCtx, "GET", reposURL, nil)
 	if err != nil {
 		return nil, ScanProjectResult{}, fmt.Errorf("failed to create list repositories request: %w", err)
 	}
@@ -661,18 +1128,20 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 		return nil, ScanProjectResult{}, fmt.Errorf("failed to decode repositories list: %w", err)
 	}
 	log.Printf("Found %d repositories in project %s.", len(repositories), args.Project)
+	totalRepos = len(repositories)
 
 	var allSummaries []ImageVulnerabilitySummary
 
 	// 2. For each repository, list artifacts and get vulnerability summaries
 	for _, repo := range repositories {
+		atomic.AddInt64(&processedRepos, 1)
 		// Private Registry repo names include the project, e.g., "my-project/my-repo". We need the part after the slash.
 		log.Printf("Processing repository: %s", repo.Name)
 		repoNameOnly := strings.TrimPrefix(repo.Name, args.Project+"/")
 		repoNameEncoded := strings.ReplaceAll(repoNameOnly, "/", "%2F")
 
 		artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts", *privateRegistryURL, args.Project, repoNameEncoded)
-		artifactsReq, err := http.NewRequestWithContext(ctx, "GET", artifactsURL, nil)
+		artifactsReq, err := http.NewRequestWithContext(opCtx, "GET", artifactsURL, nil)
 		if err != nil {
 			log.Printf("Error creating artifacts request for %s: %v", repo.Name, err)
 			continue
@@ -720,7 +1189,7 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 
 			// Include "vulnerability" in the scan request.
 			scanPayload := strings.NewReader(`{"scan_type": "vulnerability"}`)
-			scanReq, err := http.NewRequestWithContext(ctx, "POST", scanURL, scanPayload)
+			scanReq, err := http.NewRequestWithContext(opCtx, "POST", scanURL, scanPayload)
 			if err != nil {
 				log.Printf("Error creating scan request for %s:%s: %v", repo.Name, tag, err)
 				continue
@@ -746,9 +1215,15 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 			var reportData map[string]privateRegistryVulnerabilityReport
 			var reportFound bool
 			for i := 0; i < 60; i++ { // Poll up to 60 times
+				select {
+				case <-opCtx.Done():
+					log.Printf("Operation context done while polling for %s:%s: %v", repo.Name, tag, opCtx.Err())
+					break
+				default:
+				}
 				time.Sleep(3 * time.Second) // Wait before checking
 
-				reportReq, err := http.NewRequestWithContext(ctx, "GET", reportURL, nil)
+				reportReq, err := http.NewRequestWithContext(opCtx, "GET", reportURL, nil)
 				if err != nil {
 					log.Printf("Error creating report request for %s:%s: %v", repo.Name, tag, err)
 					break // Stop polling for this image on error
@@ -805,22 +1280,31 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 		}
 	}
 
+	// Send final progress state if possible
+	if req != nil && req.GetSession() != nil {
+		if ss, ok := req.GetSession().(*mcp.ServerSession); ok {
+			_ = ss.NotifyProgress(context.Background(), &mcp.ProgressNotificationParams{
+				ProgressToken: progressToken,
+				Message:       fmt.Sprintf("Completed scan for project %s", args.Project),
+				Progress:      float64(atomic.LoadInt64(&processedRepos)),
+				Total:         float64(totalRepos),
+			})
+		}
+	}
+
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found summaries for %d images in project %s.", len(allSummaries), args.Project)}},
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: fmt.Sprintf("Completed scan for project %s", args.Project)},
+		},
 	}, ScanProjectResult{Images: allSummaries}, nil
 }
 
-// FindPatchedImage searches for a newer version of an image without a specific CVE.
-// It searches in the local Private Registry, then registry.suse.com, and finally Docker Hub.
+// FindPatchedImage finds a newer version of an image without a specific CVE.
 func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPatchedImageParams) (*mcp.CallToolResult, FindPatchedImageResult, error) {
 	if *privateRegistryPassword == "" {
 		return nil, FindPatchedImageResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
-	if args.Project == "" || args.Repository == "" || args.Tag == "" || args.CVEID == "" {
-		return nil, FindPatchedImageResult{}, fmt.Errorf("project, repository, tag, and cve_id are required parameters")
-	}
 
-	// Sanitize string inputs.
 	args.Project = strings.TrimSpace(args.Project)
 	args.Repository = strings.TrimSpace(args.Repository)
 	args.Tag = strings.TrimSpace(args.Tag)
@@ -836,7 +1320,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	}
 
 	// 1. Search in the local Private Registry instance.
-	log.Printf("[%s] START: Searching for patched image for %s/%s:%s (CVE: %s)", time.Now().Format(time.RFC3339), args.Repository, args.Tag, args.CVEID)
+	log.Printf("[%s] START: Searching for patched image for %s/%s:%s (CVE: %s)", time.Now().Format(time.RFC3339), args.Project, args.Repository, args.Tag, args.CVEID)
 	repoNameEncoded := strings.ReplaceAll(args.Repository, "/", "%2F")
 	artifactsURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts?with_tag=true", *privateRegistryURL, args.Project, repoNameEncoded)
 
@@ -1493,6 +1977,30 @@ func main() {
 		Name:        "get_project_sbom",
 		Description: "Retrieves the Software Bill of Materials (SBOM) for all images in a privateRegistry project.",
 	}, GetProjectSBOM)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "list_projects",
+		Description: "Lists all projects available in the Private Registry.",
+	}, ListProjects)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "get_project",
+		Description: "Retrieves details for a single Private Registry project by name.",
+	}, GetProject)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "list_repositories",
+		Description: "Lists all repositories within a Private Registry project.",
+	}, ListRepositories)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "list_tags",
+		Description: "Lists all tags of artifacts within a repository.",
+	}, ListTags)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "list_charts",
+		Description: "Lists Helm charts in a project. Requires the Harbor instance to have chart repository support enabled (removed by default in Harbor 2.11+).",
+	}, ListCharts)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "list_chart_versions",
+		Description: "Lists versions of a single Helm chart. Requires the Harbor instance to have chart repository support enabled (removed by default in Harbor 2.11+).",
+	}, ListChartVersions)
 
 	log.Printf("MCP servers serving at %s", addr)
 	handler := mcp.NewStreamableHTTPHandler(
