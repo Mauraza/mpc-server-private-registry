@@ -6,12 +6,14 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,22 +33,88 @@ var (
 	privateRegistryURL      = flag.String("private-registry-url", "http://localhost:8081", "Private Registry instance URL")
 	privateRegistryUsername = flag.String("private-registry-username", "admin", "Private Registry username for API access")
 	privateRegistryPassword = flag.String("private-registry-password", "", "Private Registry password for API access")
+	insecureSkipTLSVerify   = flag.Bool("insecure-skip-tls-verify", false, "skip TLS certificate verification for the Private Registry")
+	mcpAuthToken            = flag.String("mcp-auth-token", "", "bearer token required when listening on a non-loopback host")
 	// Timeout for long-running scans (independent of the client's context)
 	scanTimeout      = flag.Duration("scan-timeout", 30*time.Minute, "maximum time to wait for a project scan")
 	progressInterval = flag.Duration("progress-interval", 30*time.Second, "interval between progress notifications while scanning")
 )
 
 // newPrivateRegistryHTTPClient builds an HTTP client configured to talk to the
-// Private Registry instance, matching the TLS settings used by the other tools.
+// Private Registry instance. TLS certificate verification is enabled by default.
 func newPrivateRegistryHTTPClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // Allow insecure TLS when explicitly requested
+				InsecureSkipVerify: *insecureSkipTLSVerify, //nolint:gosec // Explicitly controlled by the insecure-skip-tls-verify flag.
 			},
 		},
 	}
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func validateMCPAuth(host, token string) error {
+	if !isLoopbackHost(host) && strings.TrimSpace(token) == "" {
+		return fmt.Errorf("mcp-auth-token is required when host %q is not loopback", host)
+	}
+	return nil
+}
+
+func requireBearerToken(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme, suppliedToken, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") ||
+			subtle.ConstantTimeCompare([]byte(suppliedToken), []byte(token)) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func privateRegistryAPIGet(ctx context.Context, path string, query url.Values, result any) error {
+	endpoint := fmt.Sprintf("%s/api/v2.0/%s", strings.TrimRight(*privateRegistryURL, "/"), strings.TrimLeft(path, "/"))
+	if len(query) > 0 {
+		endpoint += "?" + query.Encode()
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create Harbor API request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+	httpReq.Header.Set("Accept", "application/json")
+
+	resp, err := newPrivateRegistryHTTPClient().Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("failed to call Harbor API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			return fmt.Errorf("Harbor API returned status %d and its error body could not be read: %w", resp.StatusCode, readErr)
+		}
+		return fmt.Errorf("Harbor API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if result == nil {
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+		return fmt.Errorf("failed to decode Harbor API response: %w", err)
+	}
+	return nil
 }
 
 // ScanImageParams defines the input for the privateRegistry image scanning tool.
@@ -176,6 +244,104 @@ type ListProjectsResult struct {
 	Projects []ProjectInfo `json:"projects"`
 }
 
+// CreateProjectParams defines the input for creating a Harbor project.
+type CreateProjectParams struct {
+	Project string `json:"project" jsonschema:"Name of the project to create"`
+	Public  bool   `json:"public,omitempty" jsonschema:"Whether the project is publicly accessible (default false)"`
+}
+
+// CreateProjectResult describes the newly created Harbor project.
+type CreateProjectResult struct {
+	Project string `json:"project"`
+	Public  bool   `json:"public"`
+}
+
+// GetHealthResult describes the overall registry health and its components.
+type GetHealthResult struct {
+	Status     string                 `json:"status,omitempty"`
+	Components []RegistryHealthStatus `json:"components"`
+}
+
+// GetHealthParams defines the input for checking Harbor health. It takes no parameters.
+type GetHealthParams struct{}
+
+// RegistryHealthStatus describes the status of one Harbor component.
+type RegistryHealthStatus struct {
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// SearchParams defines the input for searching registry projects and repositories.
+type SearchParams struct {
+	Query string `json:"query" jsonschema:"Text to search for in project and repository names"`
+}
+
+// SearchProject describes a project returned by Harbor's search endpoint.
+type SearchProject struct {
+	ID     int64  `json:"project_id"`
+	Name   string `json:"name"`
+	Public bool   `json:"public"`
+}
+
+// SearchRepository describes a repository returned by Harbor's search endpoint.
+type SearchRepository struct {
+	Name        string `json:"repository_name"`
+	ProjectName string `json:"project_name,omitempty"`
+	TagCount    int    `json:"tag_count,omitempty"`
+	StarCount   int    `json:"star_count,omitempty"`
+	PullCount   int    `json:"pull_count,omitempty"`
+}
+
+// SearchResult contains matching projects and repositories.
+type SearchResult struct {
+	Projects     []SearchProject    `json:"projects"`
+	Repositories []SearchRepository `json:"repositories"`
+}
+
+// ListQuotasParams defines filters and pagination for listing registry quotas.
+type ListQuotasParams struct {
+	Project  string `json:"project,omitempty" jsonschema:"Optional project name to filter quota results"`
+	Page     int    `json:"page,omitempty" jsonschema:"Page number (default 1)"`
+	PageSize int    `json:"page_size,omitempty" jsonschema:"Results per page, from 1 to 100 (default 100)"`
+}
+
+// RegistryQuota describes a Harbor quota and its current usage.
+type RegistryQuota struct {
+	ID         int64            `json:"id"`
+	Reference  QuotaReference   `json:"ref"`
+	Hard       map[string]int64 `json:"hard,omitempty"`
+	Used       map[string]int64 `json:"used,omitempty"`
+	UpdateTime string           `json:"update_time,omitempty"`
+}
+
+// QuotaReference identifies the resource governed by a quota.
+type QuotaReference struct {
+	ID   int64  `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+	Type string `json:"type,omitempty"`
+}
+
+// ListQuotasResult contains the requested page of quotas.
+type ListQuotasResult struct {
+	Quotas   []RegistryQuota `json:"quotas"`
+	Page     int             `json:"page"`
+	PageSize int             `json:"page_size"`
+}
+
+// ProjectSummaryParams defines the input for the read-only project overview tool.
+type ProjectSummaryParams struct {
+	Project string `json:"project" jsonschema:"The Harbor project name"`
+}
+
+// ProjectSummaryResult summarizes project metadata and repository artifact counts.
+type ProjectSummaryResult struct {
+	Found           bool        `json:"found"`
+	Project         ProjectInfo `json:"project"`
+	RepositoryCount int         `json:"repository_count"`
+	ArtifactCount   int         `json:"artifact_count"`
+}
+
 // GetProjectParams defines the input for the tool that fetches a single project's details.
 type GetProjectParams struct {
 	Project string `json:"project" jsonschema:"The Private Registry project name"`
@@ -259,14 +425,14 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 	if *privateRegistryPassword == "" {
 		return nil, ScanResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
-	if args.Project == "" || args.Repository == "" || args.Tag == "" {
-		return nil, ScanResult{}, fmt.Errorf("private-registry-password flag is not set")
-	}
 
 	// Sanitize string inputs to prevent issues with leading/trailing whitespace.
 	args.Project = strings.TrimSpace(args.Project)
 	args.Repository = strings.TrimSpace(args.Repository)
 	args.Tag = strings.TrimSpace(args.Tag)
+	if args.Project == "" || args.Repository == "" || args.Tag == "" {
+		return nil, ScanResult{}, fmt.Errorf("project, repository, and tag are required parameters")
+	}
 
 	// The repository name in the Private Registry API needs to be URL-encoded,
 	// especially if it contains slashes.
@@ -276,15 +442,8 @@ func ScanImage(ctx context.Context, req *mcp.CallToolRequest, args ScanImagePara
 	scanURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/scan",
 		*privateRegistryURL, args.Project, repo, args.Tag)
 
-	httpClient := &http.Client{
-		Timeout: 3 * time.Minute,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // Allow insecure TLS when explicitly requested
-			},
-		},
-	}
+	httpClient := newPrivateRegistryHTTPClient()
+	httpClient.Timeout = 3 * time.Minute
 
 	// Include "vulnerability" in the scan request.
 	scanPayload := strings.NewReader(`{"scan_type": "vulnerability"}`)
@@ -371,23 +530,16 @@ func GetVulnerabilities(ctx context.Context, req *mcp.CallToolRequest, args GetV
 	if *privateRegistryPassword == "" {
 		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
-	if args.Project == "" || args.Repository == "" || args.Tag == "" {
-		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("project, repository, and tag are required parameters")
-	}
 
 	// Sanitize string inputs.
 	args.Project = strings.TrimSpace(args.Project)
 	args.Repository = strings.TrimSpace(args.Repository)
 	args.Tag = strings.TrimSpace(args.Tag)
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow insecure TLS
-			},
-		},
+	if args.Project == "" || args.Repository == "" || args.Tag == "" {
+		return nil, GetVulnerabilitiesResult{}, fmt.Errorf("project, repository, and tag are required parameters")
 	}
+
+	httpClient := newPrivateRegistryHTTPClient()
 
 	repo := strings.ReplaceAll(args.Repository, "/", "%2F")
 	reportURL := fmt.Sprintf("%s/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities",
@@ -444,23 +596,16 @@ func GetSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetSBOMParams) 
 	if *privateRegistryPassword == "" {
 		return nil, GetSBOMResult{}, fmt.Errorf("private-registry-password flag is not set")
 	}
-	if args.Project == "" || args.Repository == "" || args.Tag == "" {
-		return nil, GetSBOMResult{}, fmt.Errorf("project, repository, and tag are required parameters")
-	}
 
 	// Sanitize string inputs.
 	args.Project = strings.TrimSpace(args.Project)
 	args.Repository = strings.TrimSpace(args.Repository)
 	args.Tag = strings.TrimSpace(args.Tag)
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow insecure TLS
-			},
-		},
+	if args.Project == "" || args.Repository == "" || args.Tag == "" {
+		return nil, GetSBOMResult{}, fmt.Errorf("project, repository, and tag are required parameters")
 	}
+
+	httpClient := newPrivateRegistryHTTPClient()
 
 	repo := strings.ReplaceAll(args.Repository, "/", "%2F")
 
@@ -603,14 +748,7 @@ func GetProjectSBOM(ctx context.Context, req *mcp.CallToolRequest, args GetProje
 	// Sanitize string inputs.
 	args.Project = strings.TrimSpace(args.Project)
 
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow insecure TLS
-			},
-		},
-	}
+	httpClient := newPrivateRegistryHTTPClient()
 
 	// 1. List repositories in the project
 	log.Printf("Starting SBOM retrieval for project: %s", args.Project)
@@ -764,6 +902,236 @@ func ListProjects(ctx context.Context, req *mcp.CallToolRequest, args ListProjec
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d projects.", len(result.Projects))}},
+	}, result, nil
+}
+
+// CreateProject creates a Harbor project. Projects are private unless public is true.
+func CreateProject(ctx context.Context, req *mcp.CallToolRequest, args CreateProjectParams) (*mcp.CallToolResult, CreateProjectResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, CreateProjectResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+	if args.Project == "" {
+		return nil, CreateProjectResult{}, fmt.Errorf("project is a required parameter")
+	}
+
+	payload, err := json.Marshal(struct {
+		ProjectName string `json:"project_name"`
+		Public      bool   `json:"public"`
+	}{
+		ProjectName: args.Project,
+		Public:      args.Public,
+	})
+	if err != nil {
+		return nil, CreateProjectResult{}, fmt.Errorf("failed to encode project creation request: %w", err)
+	}
+
+	endpoint := strings.TrimRight(*privateRegistryURL, "/") + "/api/v2.0/projects"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, CreateProjectResult{}, fmt.Errorf("failed to create Harbor project request: %w", err)
+	}
+	httpReq.SetBasicAuth(*privateRegistryUsername, *privateRegistryPassword)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+
+	resp, err := newPrivateRegistryHTTPClient().Do(httpReq)
+	if err != nil {
+		return nil, CreateProjectResult{}, fmt.Errorf("failed to create Harbor project %q: %w", args.Project, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			return nil, CreateProjectResult{}, fmt.Errorf("Harbor returned status %d creating project %q and its error body could not be read: %w", resp.StatusCode, args.Project, readErr)
+		}
+		return nil, CreateProjectResult{}, fmt.Errorf("Harbor returned status %d creating project %q: %s", resp.StatusCode, args.Project, strings.TrimSpace(string(body)))
+	}
+
+	result := CreateProjectResult{Project: args.Project, Public: args.Public}
+	visibility := "private"
+	if result.Public {
+		visibility = "public"
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Created %s project %q.", visibility, result.Project)}},
+	}, result, nil
+}
+
+// GetHealth retrieves the current health status of Harbor and its components.
+func GetHealth(ctx context.Context, req *mcp.CallToolRequest, args GetHealthParams) (*mcp.CallToolResult, GetHealthResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, GetHealthResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+
+	var health GetHealthResult
+	if err := privateRegistryAPIGet(ctx, "health", nil, &health); err != nil {
+		return nil, GetHealthResult{}, fmt.Errorf("failed to get Harbor health: %w", err)
+	}
+	if health.Components == nil {
+		health.Components = []RegistryHealthStatus{}
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Harbor health: %s (%d components).", health.Status, len(health.Components))}},
+	}, health, nil
+}
+
+// Search searches Harbor projects and repositories by name.
+func Search(ctx context.Context, req *mcp.CallToolRequest, args SearchParams) (*mcp.CallToolResult, SearchResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, SearchResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	args.Query = strings.TrimSpace(args.Query)
+	if args.Query == "" {
+		return nil, SearchResult{}, fmt.Errorf("query is a required parameter")
+	}
+
+	var harborResults struct {
+		Projects     []SearchProject    `json:"project"`
+		Repositories []SearchRepository `json:"repository"`
+	}
+	query := url.Values{"q": []string{args.Query}}
+	if err := privateRegistryAPIGet(ctx, "search", query, &harborResults); err != nil {
+		return nil, SearchResult{}, fmt.Errorf("failed to search Harbor: %w", err)
+	}
+	if harborResults.Projects == nil {
+		harborResults.Projects = []SearchProject{}
+	}
+	if harborResults.Repositories == nil {
+		harborResults.Repositories = []SearchRepository{}
+	}
+	result := SearchResult{Projects: harborResults.Projects, Repositories: harborResults.Repositories}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d projects and %d repositories matching %q.", len(result.Projects), len(result.Repositories), args.Query)}},
+	}, result, nil
+}
+
+// ListQuotas retrieves a page of project quotas, optionally filtered by project name.
+func ListQuotas(ctx context.Context, req *mcp.CallToolRequest, args ListQuotasParams) (*mcp.CallToolResult, ListQuotasResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, ListQuotasResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	if args.Page == 0 {
+		args.Page = 1
+	}
+	if args.Page < 1 {
+		return nil, ListQuotasResult{}, fmt.Errorf("page must be greater than zero")
+	}
+	if args.PageSize == 0 {
+		args.PageSize = 100
+	}
+	if args.PageSize < 1 || args.PageSize > 100 {
+		return nil, ListQuotasResult{}, fmt.Errorf("page_size must be between 1 and 100")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+
+	query := url.Values{
+		"page":      []string{fmt.Sprint(args.Page)},
+		"page_size": []string{fmt.Sprint(args.PageSize)},
+	}
+	if args.Project != "" {
+		var projects []struct {
+			ID   int64  `json:"project_id"`
+			Name string `json:"name"`
+		}
+		projectQuery := url.Values{"name": []string{args.Project}}
+		if err := privateRegistryAPIGet(ctx, "projects", projectQuery, &projects); err != nil {
+			return nil, ListQuotasResult{}, fmt.Errorf("failed to find project %s: %w", args.Project, err)
+		}
+		var projectID int64
+		for _, project := range projects {
+			if project.Name == args.Project {
+				projectID = project.ID
+				break
+			}
+		}
+		if projectID == 0 {
+			return nil, ListQuotasResult{}, fmt.Errorf("project %q not found", args.Project)
+		}
+		query.Set("reference", "project")
+		query.Set("reference_id", fmt.Sprint(projectID))
+	}
+	var quotas []RegistryQuota
+	if err := privateRegistryAPIGet(ctx, "quotas", query, &quotas); err != nil {
+		return nil, ListQuotasResult{}, fmt.Errorf("failed to list Harbor quotas: %w", err)
+	}
+	if quotas == nil {
+		quotas = []RegistryQuota{}
+	}
+	result := ListQuotasResult{Quotas: quotas, Page: args.Page, PageSize: args.PageSize}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Found %d quotas on page %d (page size %d).", len(result.Quotas), result.Page, result.PageSize)}},
+	}, result, nil
+}
+
+// GetProjectSummary returns project metadata and aggregated repository/artifact counts without starting scans.
+func GetProjectSummary(ctx context.Context, req *mcp.CallToolRequest, args ProjectSummaryParams) (*mcp.CallToolResult, ProjectSummaryResult, error) {
+	if *privateRegistryPassword == "" {
+		return nil, ProjectSummaryResult{}, fmt.Errorf("private-registry-password flag is not set")
+	}
+	args.Project = strings.TrimSpace(args.Project)
+	if args.Project == "" {
+		return nil, ProjectSummaryResult{}, fmt.Errorf("project is a required parameter")
+	}
+
+	projectQuery := url.Values{"name": []string{args.Project}}
+	var projects []ProjectInfo
+	if err := privateRegistryAPIGet(ctx, "projects", projectQuery, &projects); err != nil {
+		return nil, ProjectSummaryResult{}, fmt.Errorf("failed to get project details: %w", err)
+	}
+
+	var project *ProjectInfo
+	for i := range projects {
+		if projects[i].Name == args.Project {
+			project = &projects[i]
+			break
+		}
+	}
+	if project == nil {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Project %s not found.", args.Project)}},
+		}, ProjectSummaryResult{Found: false}, nil
+	}
+
+	const pageSize = 100
+	const maxPages = 1000
+	var repositories []RepositoryInfo
+	for page := 1; page <= maxPages; page++ {
+		query := url.Values{
+			"page":      []string{fmt.Sprint(page)},
+			"page_size": []string{fmt.Sprint(pageSize)},
+		}
+		path := "projects/" + url.PathEscape(args.Project) + "/repositories"
+		var pageRepositories []RepositoryInfo
+		if err := privateRegistryAPIGet(ctx, path, query, &pageRepositories); err != nil {
+			return nil, ProjectSummaryResult{}, fmt.Errorf("failed to list repositories for project %s: %w", args.Project, err)
+		}
+		repositories = append(repositories, pageRepositories...)
+		if len(pageRepositories) < pageSize {
+			break
+		}
+		if page == maxPages {
+			return nil, ProjectSummaryResult{}, fmt.Errorf("project %s has more repositories than the supported pagination limit", args.Project)
+		}
+	}
+
+	artifactCount := 0
+	for _, repository := range repositories {
+		artifactCount += repository.ArtifactCount
+	}
+	result := ProjectSummaryResult{
+		Found:           true,
+		Project:         *project,
+		RepositoryCount: len(repositories),
+		ArtifactCount:   artifactCount,
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Project %s has %d repositories and %d artifacts.", result.Project.Name, result.RepositoryCount, result.ArtifactCount)}},
 	}, result, nil
 }
 
@@ -1050,14 +1418,7 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 	// Sanitize string inputs.
 	args.Project = strings.TrimSpace(args.Project)
 
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow insecure TLS
-			},
-		},
-	}
+	httpClient := newPrivateRegistryHTTPClient()
 
 	// Use an independent operation context so scans continue even if the client
 	// disconnects. Also provide a periodic progress notification to the client.
@@ -1215,13 +1576,14 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 			var reportData map[string]privateRegistryVulnerabilityReport
 			var reportFound bool
 			for i := 0; i < 60; i++ { // Poll up to 60 times
+				timer := time.NewTimer(3 * time.Second)
 				select {
 				case <-opCtx.Done():
+					timer.Stop()
 					log.Printf("Operation context done while polling for %s:%s: %v", repo.Name, tag, opCtx.Err())
-					break
-				default:
+					return nil, ScanProjectResult{}, fmt.Errorf("project scan timed out while polling for %s:%s: %w", repo.Name, tag, opCtx.Err())
+				case <-timer.C:
 				}
-				time.Sleep(3 * time.Second) // Wait before checking
 
 				reportReq, err := http.NewRequestWithContext(opCtx, "GET", reportURL, nil)
 				if err != nil {
@@ -1233,6 +1595,9 @@ func ScanProject(ctx context.Context, req *mcp.CallToolRequest, args ScanProject
 
 				reportResp, err := httpClient.Do(reportReq)
 				if err != nil {
+					if opCtx.Err() != nil {
+						return nil, ScanProjectResult{}, fmt.Errorf("project scan timed out while fetching report for %s:%s: %w", repo.Name, tag, opCtx.Err())
+					}
 					log.Printf("Error getting report for %s:%s: %v", repo.Name, tag, err)
 					break // Stop polling for this image on error
 				}
@@ -1310,14 +1675,7 @@ func FindPatchedImage(ctx context.Context, req *mcp.CallToolRequest, args FindPa
 	args.Tag = strings.TrimSpace(args.Tag)
 	args.CVEID = strings.TrimSpace(args.CVEID)
 
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow insecure TLS
-			},
-		},
-	}
+	httpClient := newPrivateRegistryHTTPClient()
 
 	// 1. Search in the local Private Registry instance.
 	log.Printf("[%s] START: Searching for patched image for %s/%s:%s (CVE: %s)", time.Now().Format(time.RFC3339), args.Project, args.Repository, args.Tag, args.CVEID)
@@ -1941,7 +2299,7 @@ func findNewerTags(tags []string, currentTag string) []string {
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "This program runs MCP servers over SSE HTTP.\n\n")
+		fmt.Fprintf(os.Stderr, "This program runs an MCP server over Streamable HTTP.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEndpoints:\n")
@@ -1950,6 +2308,10 @@ func main() {
 	}
 	flag.Parse()
 
+	authToken := strings.TrimSpace(*mcpAuthToken)
+	if err := validateMCPAuth(*host, authToken); err != nil {
+		log.Fatal(err)
+	}
 	addr := fmt.Sprintf("%s:%s", *host, *port)
 
 	privateRegistryServer := mcp.NewServer(&mcp.Implementation{Name: "private-registry-scanner"}, nil)
@@ -1982,9 +2344,29 @@ func main() {
 		Description: "Lists all projects available in the Private Registry.",
 	}, ListProjects)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "create_project",
+		Description: "Creates a Harbor project. Projects are private by default; set public to true to make one publicly accessible.",
+	}, CreateProject)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_project",
 		Description: "Retrieves details for a single Private Registry project by name.",
 	}, GetProject)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "get_health",
+		Description: "Checks Harbor's overall health and reports component statuses.",
+	}, GetHealth)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "search",
+		Description: "Searches Harbor projects and repositories by name.",
+	}, Search)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "list_quotas",
+		Description: "Lists project storage and artifact-count quotas, optionally filtered by project name.",
+	}, ListQuotas)
+	mcp.AddTool(privateRegistryServer, &mcp.Tool{
+		Name:        "get_project_summary",
+		Description: "Summarizes project details and repository/artifact counts without starting scans.",
+	}, GetProjectSummary)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "list_repositories",
 		Description: "Lists all repositories within a Private Registry project.",
@@ -2003,7 +2385,7 @@ func main() {
 	}, ListChartVersions)
 
 	log.Printf("MCP servers serving at %s", addr)
-	handler := mcp.NewStreamableHTTPHandler(
+	var handler http.Handler = mcp.NewStreamableHTTPHandler(
 		func(request *http.Request) *mcp.Server {
 			url := request.URL.Path
 			log.Printf("Handling request for URL %s\n", url)
@@ -2014,5 +2396,8 @@ func main() {
 		},
 		nil,
 	)
+	if authToken != "" {
+		handler = requireBearerToken(authToken, handler)
+	}
 	log.Fatal(http.ListenAndServe(addr, handler))
 }

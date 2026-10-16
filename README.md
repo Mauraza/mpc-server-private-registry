@@ -32,6 +32,70 @@ go run main.go \
 
 The server will start on `localhost:8080` by default. The MCP endpoint will be available at `http://localhost:8080/mpc-spr`.
 
+### TLS and network access
+
+Harbor TLS certificates are verified by default. If a development registry uses
+a self-signed certificate, `--insecure-skip-tls-verify` explicitly disables
+that verification; use it only on a trusted network because it permits
+man-in-the-middle attacks.
+
+The MCP server listens on loopback by default. When `--host` is set to a
+non-loopback address, the server requires `--mcp-auth-token` and checks the
+`Authorization: Bearer <token>` header on every MCP request. Configure the MCP
+client to send that header. For example:
+
+```bash
+go run main.go \
+  --host "0.0.0.0" \
+  --mcp-auth-token "<long-random-token>" \
+  --private-registry-url "https://your-private-registry-instance.com" \
+  --private-registry-username "your-user" \
+  --private-registry-password "your-password"
+```
+
+The listener uses HTTP, so expose it remotely only on a trusted network or
+behind a TLS-terminating reverse proxy. Keep the bearer token secret.
+
+### Connecting an MCP client
+
+The endpoint uses **Streamable HTTP**; it is not a web page or a legacy SSE endpoint. Configure your MCP client to connect to that URL using the HTTP transport.
+
+For example, add this server to your VS Code workspace's `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "private-registry-scanner": {
+      "type": "http",
+      "url": "http://localhost:8080/mpc-spr"
+    }
+  }
+}
+```
+
+Start the Go server first, then start the MCP connection in VS Code. The client handles initialization and session headers automatically.
+
+### Troubleshooting: GET requires an Mcp-Session-Id header
+
+Opening the endpoint directly in a browser (or running a plain `curl` GET) returns:
+
+```text
+Bad Request: GET requires an Mcp-Session-Id header
+```
+
+This is expected: the server uses stateful MCP sessions. A client must first send an `initialize` POST to obtain an `Mcp-Session-Id`, then include that header on subsequent requests. A GET opens an SSE stream for an existing session; it does not initialize a connection or display a web interface.
+
+To verify connectivity without calling any registry tools, send an initialization request:
+
+```bash
+curl -i --max-time 10 http://localhost:8080/mpc-spr \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl-check","version":"1.0"}}}'
+```
+
+Expect `200 OK`, an `Mcp-Session-Id` response header, and an SSE message containing the initialization result. For further manual requests, reuse that session ID and send the `notifications/initialized` notification before listing or calling tools. Use an MCP client for normal operation rather than opening the URL in a browser.
+
 ## Display capture
 
 ### Analyze a image
@@ -39,7 +103,7 @@ The server will start on `localhost:8080` by default. The MCP endpoint will be a
 ![analyze image](screenshots/analyze-image.png)
 
 Analyze the same image with a better image in the private-registry
-![analyze image with better version](screenshots/analyze-image.png)
+![analyze image with better version](screenshots/analyze-image-better-tag.png)
 ![check the new one](screenshots/analyze-the-new-one.png)
 
 ### Analyze a project
@@ -126,3 +190,28 @@ The server exposes several tools that can be called via the MCP protocol:
 
 * **What it does**: Lists versions of a single Helm chart. Has the same Harbor chart-repository-support caveat as `list_charts`.
 * **Parameters**: `project`, `chart`.
+
+### 13. `get_health`
+
+* **What it does**: Reports Harbor's overall health and the status of its components.
+* **Parameters**: none.
+
+### 14. `search`
+
+* **What it does**: Searches Harbor projects and repositories by name.
+* **Parameters**: `query`.
+
+### 15. `list_quotas`
+
+* **What it does**: Lists project storage and artifact-count quotas, including current usage and hard limits. Results are paginated.
+* **Parameters**: optional `project`, `page` (default `1`), and `page_size` (default `100`, maximum `100`).
+
+### 16. `get_project_summary`
+
+* **What it does**: Summarizes a project's metadata, repository count, and total artifact count. This is read-only and does not trigger vulnerability scans.
+* **Parameters**: `project`.
+
+### 17. `create_project`
+
+* **What it does**: Creates a Harbor project. This changes registry state; only use it when authorized.
+* **Parameters**: `project` (required) and `public` (optional, defaults to `false`, creating a private project).
