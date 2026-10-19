@@ -70,7 +70,7 @@ The stdio transport is intended for MCP clients that launch the process. To
 run it manually:
 
 ```bash
-go run . --stdio \
+go run .  --host localhost --port 8080 \
   --private-registry-url "https://your-private-registry-instance.com" \
   --private-registry-username "your-user" \
   --private-registry-password "your-password"

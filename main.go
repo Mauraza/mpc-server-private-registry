@@ -31,7 +31,7 @@ var (
 	host                    = flag.String("host", "localhost", "host to listen on")
 	port                    = flag.String("port", "8080", "port to listen on")
 	stdio                   = flag.Bool("stdio", false, "use stdio transport instead of Streamable HTTP")
-	privateRegistryURL      = flag.String("private-registry-url", "http://localhost:8081", "Private Registry instance URL")
+	privateRegistryURL      = flag.String("private-registry-url", "http://localhost:8080", "Private Registry instance URL")
 	privateRegistryUsername = flag.String("private-registry-username", "admin", "Private Registry username for API access")
 	privateRegistryPassword = flag.String("private-registry-password", "", "Private Registry password for API access")
 	insecureSkipTLSVerify   = flag.Bool("insecure-skip-tls-verify", false, "skip TLS certificate verification for the Private Registry")
