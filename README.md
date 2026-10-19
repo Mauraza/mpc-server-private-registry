@@ -58,9 +58,29 @@ behind a TLS-terminating reverse proxy. Keep the bearer token secret.
 
 ### Connecting an MCP client
 
-The endpoint uses **Streamable HTTP**; it is not a web page or a legacy SSE endpoint. Configure your MCP client to connect to that URL using the HTTP transport.
+#### VS Code: start the server automatically
 
-For example, add this server to your VS Code workspace's `.vscode/mcp.json`:
+The workspace includes `.vscode/mcp.json`, which starts the Go server with the
+stdio transport when VS Code starts the MCP server. Open the workspace in VS
+Code, start `private-registry-scanner` from the MCP servers list, and enter the
+Private Registry URL and credentials when prompted. Go must be installed and
+available on `PATH`.
+
+The stdio transport is intended for MCP clients that launch the process. To
+run it manually:
+
+```bash
+go run . --stdio \
+  --private-registry-url "https://your-private-registry-instance.com" \
+  --private-registry-username "your-user" \
+  --private-registry-password "your-password"
+```
+
+#### Connect to an existing HTTP server
+
+The server also supports **Streamable HTTP**. This mode is useful for clients
+that connect to an already-running server; it does not launch the Go process.
+Start the server first, then configure the MCP client:
 
 ```json
 {
@@ -73,7 +93,8 @@ For example, add this server to your VS Code workspace's `.vscode/mcp.json`:
 }
 ```
 
-Start the Go server first, then start the MCP connection in VS Code. The client handles initialization and session headers automatically.
+The HTTP endpoint is not a web page or a legacy SSE endpoint. The MCP client
+handles initialization and session headers automatically.
 
 ### Troubleshooting: GET requires an Mcp-Session-Id header
 

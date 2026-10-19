@@ -30,6 +30,7 @@ import (
 var (
 	host                    = flag.String("host", "localhost", "host to listen on")
 	port                    = flag.String("port", "8080", "port to listen on")
+	stdio                   = flag.Bool("stdio", false, "use stdio transport instead of Streamable HTTP")
 	privateRegistryURL      = flag.String("private-registry-url", "http://localhost:8081", "Private Registry instance URL")
 	privateRegistryUsername = flag.String("private-registry-username", "admin", "Private Registry username for API access")
 	privateRegistryPassword = flag.String("private-registry-password", "", "Private Registry password for API access")
@@ -2299,7 +2300,7 @@ func findNewerTags(tags []string, currentTag string) []string {
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "This program runs an MCP server over Streamable HTTP.\n\n")
+		fmt.Fprintf(os.Stderr, "This program runs an MCP server over Streamable HTTP or stdio.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEndpoints:\n")
@@ -2308,9 +2309,12 @@ func main() {
 	}
 	flag.Parse()
 
-	authToken := strings.TrimSpace(*mcpAuthToken)
-	if err := validateMCPAuth(*host, authToken); err != nil {
-		log.Fatal(err)
+	var authToken string
+	if !*stdio {
+		authToken = strings.TrimSpace(*mcpAuthToken)
+		if err := validateMCPAuth(*host, authToken); err != nil {
+			log.Fatal(err)
+		}
 	}
 	addr := fmt.Sprintf("%s:%s", *host, *port)
 
@@ -2383,6 +2387,13 @@ func main() {
 		Name:        "list_chart_versions",
 		Description: "Lists versions of a single Helm chart. Requires the Harbor instance to have chart repository support enabled (removed by default in Harbor 2.11+).",
 	}, ListChartVersions)
+
+	if *stdio {
+		if err := privateRegistryServer.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	log.Printf("MCP servers serving at %s", addr)
 	var handler http.Handler = mcp.NewStreamableHTTPHandler(

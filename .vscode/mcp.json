@@ -1,0 +1,38 @@
+{
+  "servers": {
+    "private-registry-scanner": {
+      "type": "stdio",
+      "command": "go",
+      "args": [
+        "run",
+        ".",
+        "--stdio",
+        "--private-registry-url",
+        "${input:privateRegistryURL}",
+        "--private-registry-username",
+        "${input:privateRegistryUsername}",
+        "--private-registry-password",
+        "${input:privateRegistryPassword}"
+      ]
+    }
+  },
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "privateRegistryURL",
+      "description": "Private Registry URL",
+      "default": "http://localhost:8080"
+    },
+    {
+      "type": "promptString",
+      "id": "privateRegistryUsername",
+      "description": "Private Registry username"
+    },
+    {
+      "type": "promptString",
+      "id": "privateRegistryPassword",
+      "description": "Private Registry password",
+      "password": true
+    }
+  ]
+}
