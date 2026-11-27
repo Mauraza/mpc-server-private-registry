@@ -24,7 +24,7 @@ To run the server, you need to provide the Private Registry based on Harbor inst
 
 ```bash
 # Example of running the server
-go run main.go \
+go run . \
   --private-registry-url "https://your-private-registry-instance.com" \
   --private-registry-username "your-user" \
   --private-registry-password "your-password"
@@ -45,7 +45,7 @@ non-loopback address, the server requires `--mcp-auth-token` and checks the
 client to send that header. For example:
 
 ```bash
-go run main.go \
+go run . \
   --host "0.0.0.0" \
   --mcp-auth-token "<long-random-token>" \
   --private-registry-url "https://your-private-registry-instance.com" \
@@ -55,6 +55,33 @@ go run main.go \
 
 The listener uses HTTP, so expose it remotely only on a trusted network or
 behind a TLS-terminating reverse proxy. Keep the bearer token secret.
+
+### Docker and Kubernetes
+
+For a network-accessible deployment, build the container image and install the
+optional companion chart alongside an existing SUSE Private Registry. The
+chart is independent of the SPR chart and does not change it. See the
+[container and Helm deployment guide](docs/container-deployment.md) for image
+distribution, credentials, TLS, and ingress. For a local
+client, the existing Go/stdio setup below is often simpler.
+
+#### Helm chart
+
+A companion Helm chart lives at
+[charts/private-registry-mcp](charts/private-registry-mcp), with its own
+[README.md](charts/private-registry-mcp/README.md) documenting installation,
+all configurable parameters, and credential/TLS/Ingress setup in detail:
+
+```bash
+helm upgrade --install registry-mcp ./charts/private-registry-mcp \
+  --namespace mcp-system \
+  --create-namespace \
+  -f mcp-values.yaml
+```
+
+The chart does not build or publish an image; build it locally (`docker build
+-t private-registry-mcp:local .`) and make it available to the cluster nodes
+before installing.
 
 ### Connecting an MCP client
 
@@ -70,7 +97,7 @@ The stdio transport is intended for MCP clients that launch the process. To
 run it manually:
 
 ```bash
-go run .  --host localhost --port 8080 \
+go run . --stdio \
   --private-registry-url "https://your-private-registry-instance.com" \
   --private-registry-username "your-user" \
   --private-registry-password "your-password"

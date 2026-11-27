@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -70,6 +71,25 @@ func validateMCPAuth(host, token string) error {
 	return nil
 }
 
+func applyEnvironmentDefaults(flags *flag.FlagSet) error {
+	for _, setting := range []struct {
+		env  string
+		flag string
+	}{
+		{"PRIVATE_REGISTRY_URL", "private-registry-url"},
+		{"PRIVATE_REGISTRY_USERNAME", "private-registry-username"},
+		{"PRIVATE_REGISTRY_PASSWORD", "private-registry-password"},
+		{"MCP_AUTH_TOKEN", "mcp-auth-token"},
+	} {
+		if value, ok := os.LookupEnv(setting.env); ok {
+			if err := flags.Set(setting.flag, value); err != nil {
+				return fmt.Errorf("configure %s: %w", setting.env, err)
+			}
+		}
+	}
+	return nil
+}
+
 func requireBearerToken(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scheme, suppliedToken, ok := strings.Cut(r.Header.Get("Authorization"), " ")
@@ -81,6 +101,66 @@ func requireBearerToken(token string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// healthzHandler reports process liveness. It never calls out to the Private
+// Registry, so a Harbor outage does not cause Kubernetes to restart the pod.
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "ok")
+}
+
+const readinessCacheTTL = 5 * time.Second
+
+// readinessCache memoizes the last Private Registry health check so that
+// frequent readiness probes don't hammer Harbor.
+var readinessCache struct {
+	mu      sync.Mutex
+	expires time.Time
+	healthy bool
+}
+
+// readyzHandler reports whether the Private Registry is reachable and
+// healthy, backing the Kubernetes readiness probe.
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	readinessCache.mu.Lock()
+	if cached, ok := readinessCache.healthy, time.Now().Before(readinessCache.expires); ok {
+		readinessCache.mu.Unlock()
+		writeReadyStatus(w, cached)
+		return
+	}
+	readinessCache.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	healthy := checkPrivateRegistryHealth(ctx)
+
+	readinessCache.mu.Lock()
+	readinessCache.healthy = healthy
+	readinessCache.expires = time.Now().Add(readinessCacheTTL)
+	readinessCache.mu.Unlock()
+
+	writeReadyStatus(w, healthy)
+}
+
+func checkPrivateRegistryHealth(ctx context.Context) bool {
+	if *privateRegistryPassword == "" {
+		return false
+	}
+	var health GetHealthResult
+	if err := privateRegistryAPIGet(ctx, "health", nil, &health); err != nil {
+		return false
+	}
+	return health.Status == "healthy"
+}
+
+func writeReadyStatus(w http.ResponseWriter, healthy bool) {
+	if !healthy {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "ok")
 }
 
 func privateRegistryAPIGet(ctx context.Context, path string, query url.Values, result any) error {
@@ -2305,7 +2385,12 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEndpoints:\n")
 		fmt.Fprintf(os.Stderr, "  /mpc-spr   - Private Registry scanning service\n")
+		fmt.Fprintf(os.Stderr, "  /healthz   - liveness probe (always ok)\n")
+		fmt.Fprintf(os.Stderr, "  /readyz    - readiness probe (checks Private Registry health)\n")
 		os.Exit(1)
+	}
+	if err := applyEnvironmentDefaults(flag.CommandLine); err != nil {
+		log.Fatal(err)
 	}
 	flag.Parse()
 
@@ -2319,73 +2404,74 @@ func main() {
 	addr := fmt.Sprintf("%s:%s", *host, *port)
 
 	privateRegistryServer := mcp.NewServer(&mcp.Implementation{Name: "private-registry-scanner"}, nil)
+
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "scan_image",
-		Description: "Scans a container image in Private Registry for vulnerabilities using Trivy.",
+		Description: "🔍 [SECURITY] Scan a single container image for vulnerabilities using Trivy. Returns list of CVEs with severity, affected packages, and fix versions. Use this when you need a detailed security analysis of a specific image version.",
 	}, ScanImage)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "scan_project",
-		Description: "Scans all images in a Private Registry project and provides a vulnerability summary.",
+		Description: "🔍 [SECURITY] Scan all images in a registry project and provide a vulnerability summary. Returns vulnerability counts (critical/high/medium/low/unknown) per image. Use this for quick security posture assessment across a project.",
 	}, ScanProject)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "find_patched_image",
-		Description: "Finds a newer version of an image without a specific CVE.",
+		Description: "🛡️ [REMEDIATION] Find a newer version of an image without a specific CVE. Helpful for patching known vulnerabilities. Returns the patched image location or indicates if no patch is available.",
 	}, FindPatchedImage)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_vulnerabilities",
-		Description: "Retrieves all vulnerabilities for a specific container image from Private Registry.",
+		Description: "📋 [SECURITY] Retrieve detailed vulnerability information for a specific image. Returns comprehensive list of all detected CVEs with package names, versions, and fix information.",
 	}, GetVulnerabilities)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_sbom",
-		Description: "Retrieves the Software Bill of Materials (SBOM) for a specific container image from privateRegistry.",
+		Description: "📦 [COMPLIANCE] Get Software Bill of Materials (SBOM) for a single container image. Useful for compliance audits, license tracking, and supply chain verification. Returns SBOM data and download URL.",
 	}, GetSBOM)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_project_sbom",
-		Description: "Retrieves the Software Bill of Materials (SBOM) for all images in a privateRegistry project.",
+		Description: "📦 [COMPLIANCE] Get SBOMs for all images in a project. Batch operation for compliance and license audits across multiple images.",
 	}, GetProjectSBOM)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "list_projects",
-		Description: "Lists all projects available in the Private Registry.",
+		Description: "📁 [INVENTORY] List all projects in the private registry. Returns project names and metadata. Use for discovery and inventory management.",
 	}, ListProjects)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "create_project",
-		Description: "Creates a Harbor project. Projects are private by default; set public to true to make one publicly accessible.",
+		Description: "➕ [PROVISIONING] Create a new project in the private registry. Can set project visibility (public/private). Returns project details.",
 	}, CreateProject)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_project",
-		Description: "Retrieves details for a single Private Registry project by name.",
+		Description: "ℹ️ [INVENTORY] Get details about a single registry project. Returns project metadata including repository and artifact counts.",
 	}, GetProject)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_health",
-		Description: "Checks Harbor's overall health and reports component statuses.",
+		Description: "💊 [MONITORING] Check registry health status and component statuses. Useful for observability and monitoring dashboards.",
 	}, GetHealth)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "search",
-		Description: "Searches Harbor projects and repositories by name.",
+		Description: "🔎 [DISCOVERY] Search for projects and repositories by name. Useful for finding specific images in large registries.",
 	}, Search)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "list_quotas",
-		Description: "Lists project storage and artifact-count quotas, optionally filtered by project name.",
+		Description: "📊 [CAPACITY] List storage quotas and artifact-count limits for projects. Helps with capacity planning and resource management.",
 	}, ListQuotas)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "get_project_summary",
-		Description: "Summarizes project details and repository/artifact counts without starting scans.",
+		Description: "📈 [INVENTORY] Get a quick summary of a project without triggering scans. Returns repository and artifact counts, creation time, and basic metadata.",
 	}, GetProjectSummary)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "list_repositories",
-		Description: "Lists all repositories within a Private Registry project.",
+		Description: "🗂️ [INVENTORY] List all repositories within a specific project. Returns repository names and metadata.",
 	}, ListRepositories)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "list_tags",
-		Description: "Lists all tags of artifacts within a repository.",
+		Description: "🏷️ [INVENTORY] List all artifact tags within a repository. Returns tag names and artifact metadata for version/image discovery.",
 	}, ListTags)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "list_charts",
-		Description: "Lists Helm charts in a project. Requires the Harbor instance to have chart repository support enabled (removed by default in Harbor 2.11+).",
+		Description: "📋 [INVENTORY] List Helm charts in a project. Note: Requires chart repository support enabled in Harbor (may be unavailable in Harbor 2.11+).",
 	}, ListCharts)
 	mcp.AddTool(privateRegistryServer, &mcp.Tool{
 		Name:        "list_chart_versions",
-		Description: "Lists versions of a single Helm chart. Requires the Harbor instance to have chart repository support enabled (removed by default in Harbor 2.11+).",
+		Description: "📦 [INVENTORY] List available versions of a specific Helm chart. Useful for chart version discovery and upgrade planning.",
 	}, ListChartVersions)
 
 	if *stdio {
@@ -2396,19 +2482,31 @@ func main() {
 	}
 
 	log.Printf("MCP servers serving at %s", addr)
-	var handler http.Handler = mcp.NewStreamableHTTPHandler(
+	log.Fatal(http.ListenAndServe(addr, newHTTPHandler(privateRegistryServer, authToken)))
+}
+
+// newHTTPHandler builds the top-level HTTP routing: the MCP endpoint (guarded
+// by authToken when set) plus unauthenticated /healthz and /readyz probes
+// that Kubernetes can reach without an MCP session or bearer token.
+func newHTTPHandler(server *mcp.Server, authToken string) http.Handler {
+	var mcpHandler http.Handler = mcp.NewStreamableHTTPHandler(
 		func(request *http.Request) *mcp.Server {
 			url := request.URL.Path
 			log.Printf("Handling request for URL %s\n", url)
 			if url == "/mpc-spr" {
-				return privateRegistryServer
+				return server
 			}
 			return nil
 		},
 		nil,
 	)
 	if authToken != "" {
-		handler = requireBearerToken(authToken, handler)
+		mcpHandler = requireBearerToken(authToken, mcpHandler)
 	}
-	log.Fatal(http.ListenAndServe(addr, handler))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.Handle("/mpc-spr", mcpHandler)
+	return mux
 }

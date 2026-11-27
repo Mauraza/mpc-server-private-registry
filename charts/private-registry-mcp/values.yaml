@@ -1,0 +1,36 @@
+image:
+  repository: private-registry-mcp
+  tag: local
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+registry:
+  url: ""
+  username: ""
+  existingSecret: ""
+  passwordKey: password
+  # Optional Secret containing a CA certificate under the ca.crt key.
+  caSecret: ""
+
+auth:
+  existingSecret: ""
+  tokenKey: token
+
+# Optional dockerconfigjson Secret for crane's upstream registry authentication.
+crane:
+  existingSecret: ""
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  tlsSecret: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

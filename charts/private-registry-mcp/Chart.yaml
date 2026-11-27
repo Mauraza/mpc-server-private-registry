@@ -1,0 +1,6 @@
+apiVersion: v2
+name: private-registry-mcp
+description: Companion MCP server for an existing SUSE Private Registry installation
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

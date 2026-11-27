@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "private-registry-mcp.fullname" . }}
+  labels:
+    {{- include "private-registry-mcp.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: private-registry-mcp
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "private-registry-mcp.labels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: mcp
+          image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--host", "0.0.0.0"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PRIVATE_REGISTRY_URL
+              value: {{ required "registry.url is required" .Values.registry.url | quote }}
+            - name: PRIVATE_REGISTRY_USERNAME
+              value: {{ required "registry.username is required" .Values.registry.username | quote }}
+            - name: PRIVATE_REGISTRY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "registry.existingSecret is required" .Values.registry.existingSecret | quote }}
+                  key: {{ required "registry.passwordKey is required" .Values.registry.passwordKey | quote }}
+            - name: MCP_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.existingSecret is required" .Values.auth.existingSecret | quote }}
+                  key: {{ required "auth.tokenKey is required" .Values.auth.tokenKey | quote }}
+            {{- if .Values.registry.caSecret }}
+            - name: SSL_CERT_DIR
+              value: /etc/ssl/certs:/etc/mcp-ca
+            {{- end }}
+            {{- if .Values.crane.existingSecret }}
+            - name: DOCKER_CONFIG
+              value: /etc/crane
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- if or .Values.registry.caSecret .Values.crane.existingSecret }}
+          volumeMounts:
+            {{- if .Values.registry.caSecret }}
+            - name: registry-ca
+              mountPath: /etc/mcp-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.crane.existingSecret }}
+            - name: crane-config
+              mountPath: /etc/crane
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.registry.caSecret .Values.crane.existingSecret }}
+      volumes:
+        {{- if .Values.registry.caSecret }}
+        - name: registry-ca
+          secret:
+            secretName: {{ .Values.registry.caSecret | quote }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- if .Values.crane.existingSecret }}
+        - name: crane-config
+          secret:
+            secretName: {{ .Values.crane.existingSecret | quote }}
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+        {{- end }}
+      {{- end }}

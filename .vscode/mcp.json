@@ -20,8 +20,7 @@
     {
       "type": "promptString",
       "id": "privateRegistryURL",
-      "description": "Private Registry URL",
-      "default": "http://localhost:8080"
+      "description": "Harbor base URL (not the MCP endpoint), e.g. https://harbor.example"
     },
     {
       "type": "promptString",
