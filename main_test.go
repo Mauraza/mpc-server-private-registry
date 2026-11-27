@@ -3,12 +3,61 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestEnvironmentDefaultsAndFlagPrecedence(t *testing.T) {
+	t.Setenv("PRIVATE_REGISTRY_URL", "https://registry.example")
+	t.Setenv("PRIVATE_REGISTRY_USERNAME", "robot")
+	t.Setenv("PRIVATE_REGISTRY_PASSWORD", "env-password")
+	t.Setenv("MCP_AUTH_TOKEN", "env-token")
+
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	registryURL := flags.String("private-registry-url", "default-url", "")
+	username := flags.String("private-registry-username", "admin", "")
+	password := flags.String("private-registry-password", "", "")
+	token := flags.String("mcp-auth-token", "", "")
+	if err := applyEnvironmentDefaults(flags); err != nil {
+		t.Fatal(err)
+	}
+	if err := flags.Parse([]string{"--private-registry-password=flag-password", "--mcp-auth-token="}); err != nil {
+		t.Fatal(err)
+	}
+	if *registryURL != "https://registry.example" || *username != "robot" ||
+		*password != "flag-password" || *token != "" {
+		t.Fatalf("unexpected configuration: URL=%q username=%q password=%q token=%q",
+			*registryURL, *username, *password, *token)
+	}
+}
+
+func TestMissingEnvironmentPreservesFlagDefaults(t *testing.T) {
+	for _, name := range []string{"PRIVATE_REGISTRY_URL", "PRIVATE_REGISTRY_USERNAME", "PRIVATE_REGISTRY_PASSWORD", "MCP_AUTH_TOKEN"} {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	registryURL := flags.String("private-registry-url", "default-url", "")
+	username := flags.String("private-registry-username", "admin", "")
+	password := flags.String("private-registry-password", "", "")
+	token := flags.String("mcp-auth-token", "", "")
+	if err := applyEnvironmentDefaults(flags); err != nil {
+		t.Fatal(err)
+	}
+	if *registryURL != "default-url" || *username != "admin" || *password != "" || *token != "" {
+		t.Fatal("missing environment variables changed flag defaults")
+	}
+}
 
 func TestReadOnlyRegistryTools(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -300,4 +349,101 @@ func TestRequireBearerToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+func resetReadinessCache() {
+	readinessCache.mu.Lock()
+	readinessCache.expires = time.Time{}
+	readinessCache.healthy = false
+	readinessCache.mu.Unlock()
+}
+
+func TestHealthzHandler(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recorder := httptest.NewRecorder()
+
+	healthzHandler(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+}
+
+func TestReadyzHandler(t *testing.T) {
+	tests := []struct {
+		name          string
+		noCredentials bool
+		backendStatus int
+		backendBody   string
+		wantStatus    int
+	}{
+		{name: "healthy", backendStatus: http.StatusOK, backendBody: `{"status":"healthy"}`, wantStatus: http.StatusOK},
+		{name: "unhealthy status", backendStatus: http.StatusOK, backendBody: `{"status":"unhealthy"}`, wantStatus: http.StatusServiceUnavailable},
+		{name: "backend error", backendStatus: http.StatusInternalServerError, wantStatus: http.StatusServiceUnavailable},
+		{name: "missing credentials", noCredentials: true, wantStatus: http.StatusServiceUnavailable},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(test.backendStatus)
+				fmt.Fprint(w, test.backendBody)
+			}))
+			defer server.Close()
+
+			oldURL, oldPassword := *privateRegistryURL, *privateRegistryPassword
+			*privateRegistryURL = server.URL
+			*privateRegistryPassword = "test-password"
+			if test.noCredentials {
+				*privateRegistryPassword = ""
+			}
+			defer func() {
+				*privateRegistryURL, *privateRegistryPassword = oldURL, oldPassword
+			}()
+			resetReadinessCache()
+
+			req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+			recorder := httptest.NewRecorder()
+
+			readyzHandler(recorder, req)
+
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
+			}
+		})
+	}
+}
+
+func TestNewHTTPHandlerProbesBypassAuth(t *testing.T) {
+	resetReadinessCache()
+	oldPassword := *privateRegistryPassword
+	*privateRegistryPassword = ""
+	defer func() { *privateRegistryPassword = oldPassword }()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test"}, nil)
+	handler := newHTTPHandler(server, "secret")
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+
+			handler.ServeHTTP(recorder, req)
+
+			if recorder.Code == http.StatusUnauthorized {
+				t.Fatalf("%s should not require bearer auth, got 401", path)
+			}
+		})
+	}
+
+	t.Run("/mpc-spr requires auth", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/mpc-spr", nil)
+		recorder := httptest.NewRecorder()
+
+		handler.ServeHTTP(recorder, req)
+
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+		}
+	})
 }
